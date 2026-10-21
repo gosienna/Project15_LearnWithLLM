@@ -19,6 +19,7 @@ export interface TopicRecord {
   svg: string;
   json: string;
   materialMarkdown: string;
+  /** The old chat, kept so earlier records still load. Asks are not saved. */
   messages: DialogueMessage[];
   createdAt: number;
   updatedAt: number;
@@ -31,7 +32,7 @@ export interface DialogueMessage {
   role: "user" | "assistant";
   content: string;
   createdAt: number;
-  /** What happened during an assistant turn, for Debug mode. Absent on older records. */
+  /** What happened during an assistant turn. Older records only; nothing writes messages now. */
   trace?: TurnTrace;
 }
 
@@ -41,24 +42,44 @@ export type TraceEvent =
   | { kind: "reasoning"; text: string }
   | { kind: "tool"; name: string; input: unknown; output?: unknown; error?: string; ms?: number };
 
-/** The raw input of one request. A reused session receives only the prompt. */
+/** Where on the whiteboard the learner pointed: a text range or a whole element. */
+export interface SelectionAnchor {
+  kind: "text" | "element";
+  /** Inside #lesson-svg it is svg; anywhere else on the page it is html. */
+  component: "html" | "svg";
+  /** A CSS path from body or #lesson-svg, as the live page resolves it. */
+  selector: string;
+  tag: string;
+  /** The selected text with some text on each side, so the spot is found even when the selector is not. */
+  quote: { exact: string; prefix: string; suffix: string };
+  /** The live element, capped. */
+  outerHTML: string;
+  /** In the board frame's viewport, for placing the question panel. */
+  rect: { x: number; y: number; width: number; height: number };
+}
+
+/** The raw input of one ask. Every ask creates a new session. */
 export interface RequestInput {
-  newSession: boolean;
-  /** The messages a new session was created with: system first, then history. */
-  initialPrompts?: PromptMessage[];
+  /** The messages the session was created with: the system prompt, or an edited list. */
+  initialPrompts: PromptMessage[];
   prompt: string;
+  selection?: SelectionAnchor;
   /** The initial prompts came from the Debug editor instead of the topic. */
   edited?: boolean;
 }
 
 export interface TurnTrace {
+  id?: string;
   modelId: string | null;
+  /** The learner's question and where they pointed, for the Trace tab. */
+  question?: string;
+  selection?: SelectionAnchor;
   startedAt: number;
   endedAt?: number;
   events: TraceEvent[];
-  /** The streamed reply, kept only when the fallback replaced it in the chat. */
+  /** The streamed reply, kept only when a fallback moved it onto the whiteboard. */
   rawReply?: string;
-  fallback?: "html" | "svg";
+  fallback?: "html" | "svg" | "note";
   /** What this turn sent to the model. */
   request?: RequestInput;
   inputUsage?: number;

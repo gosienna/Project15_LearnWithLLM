@@ -2,20 +2,21 @@ import { parseLesson } from "../document/markdown.ts";
 import type { TopicRepository } from "../storage/db.ts";
 import type {
   CreateOptions,
-  DialogueMessage,
   LanguageModelAPI,
   LanguageModelSession,
   PromptMessage,
+  SelectionAnchor,
   ToolDeclaration,
   TopicRecord,
-  TraceEvent,
+  TurnTrace,
 } from "../types.ts";
-import { boardIsEmpty, titleFromHtml } from "../ui/whiteboard.ts";
-import { buildPrompt, estimateTokens } from "./system-prompt.ts";
+import { boardIsEmpty, insertNote, titleFromHtml } from "../ui/whiteboard.ts";
+import { buildPrompt, estimateTokens, type BuiltPrompt } from "./system-prompt.ts";
 import { createWhiteboardTools } from "./tools.ts";
 import { capText, TraceRecorder } from "./trace.ts";
 
-export const FALLBACK_ASSISTANT = "I put the lesson on the whiteboard.";
+/** Shown when a turn ends and the board did not change. */
+export const NOTHING_CHANGED = "The model did not change the whiteboard. Ask again, or try a different model.";
 
 const SVG_MARKUP = /<svg\b[\s\S]*?<\/svg>/i;
 
@@ -26,7 +27,7 @@ export function extractBoardSvg(reply: string): string | null {
   return /<svg\b/i.test(svg) ? svg : null;
 }
 
-function replyIsToolDump(reply: string): boolean {
+export function replyIsToolDump(reply: string): boolean {
   return /whiteboard_replace_document|```tool_code|whiteboard_set\s*\(/i.test(reply);
 }
 
@@ -50,35 +51,36 @@ export function errorNote(error: unknown): string | null {
     case "QuotaExceededError":
       return "The lesson or the conversation is over the model's limit. Shorten the request.";
     case "InvalidStateError":
-      return "The session was lost. The next send creates a new one.";
+      return "The session was lost. Ask again.";
     case "AbortError":
       return null;
     case "NetworkError":
     case "OperationError":
-      return "The request failed. Send again.";
+      return "The request failed. Ask again.";
     default:
       return err?.message || "The request failed.";
   }
 }
 
-export interface StreamState {
-  text: string | null;
-  toolActive: boolean;
-  /** The turn so far, for Debug mode. */
-  events: TraceEvent[];
-}
-
-export interface ConversationDeps {
+export interface TutorDeps {
   repo: TopicRepository;
   languageModel: () => LanguageModelAPI | null;
   getOpenTopicId: () => string | null;
   onTopic: (topic: TopicRecord) => void;
-  onStream: (topicId: string, stream: StreamState | null) => void;
+  /** The trace of an ask, while it runs and once more when it is done. The same object each time. */
+  onTrace: (topicId: string, trace: TurnTrace, done: boolean) => void;
   onError: (message: string | null) => void;
   onBusy: (busy: boolean) => void;
   onDownload: (ratio: number | null) => void;
   contextTokens?: () => number | undefined;
   modelId?: () => string | null;
+}
+
+export interface AskOptions {
+  /** Where the learner pointed. Null for the first question and toolbar actions. */
+  anchor?: SelectionAnchor | null;
+  /** Put a reply that changed nothing onto the board as a note. On by default. */
+  note?: boolean;
 }
 
 async function* iterateText(source: AsyncIterable<string> | ReadableStream<string>): AsyncGenerator<string> {
@@ -98,70 +100,61 @@ async function* iterateText(source: AsyncIterable<string> | ReadableStream<strin
   }
 }
 
-export class Conversation {
-  private session: LanguageModelSession | null = null;
-  private sessionTopicId: string | null = null;
+function sourcesOf(topic: TopicRecord) {
+  return { html: topic.html, css: topic.css, js: topic.js, svg: topic.svg, json: topic.json };
+}
+
+/**
+ * Answers the learner on the whiteboard. Every ask is its own session with one system prompt and
+ * one prompt: no history, and nothing but the board is saved.
+ */
+export class Tutor {
   private abort: AbortController | null = null;
   private epoch = 0;
   private busy = false;
-  /** The initial prompts of a session created during the current turn, for its trace. */
-  private createdPrompts: PromptMessage[] | null = null;
-  /** Initial prompts edited in Debug mode, used once by the topic's next send. */
+  /** Initial prompts edited in Debug mode, used once by the topic's next ask. */
   private readonly nextPrompts = new Map<string, PromptMessage[]>();
-  private resetAfterTurn = false;
 
-  constructor(private readonly deps: ConversationDeps) {}
+  constructor(private readonly deps: TutorDeps) {}
 
   get isBusy(): boolean {
     return this.busy;
   }
 
-  destroySession(): void {
-    this.session?.destroy();
-    this.session = null;
-    this.sessionTopicId = null;
-  }
-
-  /** Use these initial prompts, in a new session, for the topic's next send. Null discards them. */
+  /** Use these initial prompts for the topic's next ask. Null discards them. */
   setNextRequest(topicId: string, prompts: PromptMessage[] | null): void {
     if (prompts) this.nextPrompts.set(topicId, prompts.map((message) => ({ ...message })));
     else this.nextPrompts.delete(topicId);
   }
 
-  /** Start a new session on the next send, without cutting off a turn that is running. */
-  resetSession(): void {
-    if (this.busy) this.resetAfterTurn = true;
-    else this.destroySession();
-  }
-
-  /** The system prompt the topic's next new session gets: the pinned one or the automatic one. */
-  previewSystem(topic: TopicRecord): { text: string; pinned: boolean } {
-    if (topic.systemPrompt !== undefined) return { text: topic.systemPrompt, pinned: true };
-    const built = buildPrompt({
-      sources: { html: topic.html, css: topic.css, js: topic.js, svg: topic.svg, json: topic.json },
+  private build(topic: TopicRecord, question: string, anchor: SelectionAnchor | null, maxFullSections?: number): BuiltPrompt {
+    return buildPrompt({
+      sources: sourcesOf(topic),
       materialMarkdown: topic.materialMarkdown,
-      messages: [],
+      question,
+      anchor,
       contextTokens: this.deps.contextTokens?.(),
-    });
-    return { text: built.system, pinned: false };
-  }
-
-  /** What the next send on this topic will use, if the learner sends now. */
-  previewRequest(topic: TopicRecord): { newSession: boolean; edited: boolean; initialPrompts: PromptMessage[] } {
-    const edited = this.nextPrompts.get(topic.id);
-    if (edited) return { newSession: true, edited: true, initialPrompts: edited.map((message) => ({ ...message })) };
-    const built = buildPrompt({
-      sources: { html: topic.html, css: topic.css, js: topic.js, svg: topic.svg, json: topic.json },
-      materialMarkdown: topic.materialMarkdown,
-      messages: topic.messages,
-      contextTokens: this.deps.contextTokens?.(),
+      maxFullSections,
       systemOverride: topic.systemPrompt,
     });
-    return {
-      newSession: !(this.session && this.sessionTopicId === topic.id),
-      edited: false,
-      initialPrompts: [{ role: "system", content: built.system }, ...built.history],
-    };
+  }
+
+  /** The system prompt every ask on this topic starts from: the pinned one or the automatic one. */
+  previewSystem(topic: TopicRecord): { text: string; pinned: boolean } {
+    if (topic.systemPrompt !== undefined) return { text: topic.systemPrompt, pinned: true };
+    return { text: this.build(topic, "", null).system, pinned: false };
+  }
+
+  /** The initial prompts the topic's next ask creates its session with. */
+  previewRequest(topic: TopicRecord): { edited: boolean; initialPrompts: PromptMessage[] } {
+    const edited = this.nextPrompts.get(topic.id);
+    if (edited) return { edited: true, initialPrompts: edited.map((message) => ({ ...message })) };
+    return { edited: false, initialPrompts: [{ role: "system", content: this.build(topic, "", null).system }] };
+  }
+
+  /** The prompt the next ask sends for this question and selection. */
+  previewPrompt(topic: TopicRecord, question: string, anchor: SelectionAnchor | null): string {
+    return this.build(topic, question.trim(), anchor).prompt;
   }
 
   stop(): void {
@@ -171,23 +164,20 @@ export class Conversation {
   cancelForSwitch(): void {
     this.epoch += 1;
     this.stop();
-    this.destroySession();
-    this.resetAfterTurn = false;
     this.busy = false;
     this.abort = null;
     this.deps.onBusy(false);
   }
 
-  async send(topicId: string, text: string): Promise<void> {
-    const trimmed = text.trim();
+  async ask(topicId: string, question: string, options: AskOptions = {}): Promise<void> {
+    const trimmed = question.trim();
     if (!trimmed || this.busy) return;
+    const anchor = options.anchor ?? null;
     const epoch = this.epoch;
     const alive = () => epoch === this.epoch;
     const model = this.deps.languageModel();
     if (!model) {
-      this.deps.onError(
-        "The page cannot see a model. Enable this site in the extension and reload.",
-      );
+      this.deps.onError("The page cannot see a model. Enable this site in the extension and reload.");
       return;
     }
 
@@ -203,28 +193,15 @@ export class Conversation {
       return;
     }
 
-    const userMessage: DialogueMessage = {
-      id: crypto.randomUUID(),
-      role: "user",
-      content: trimmed,
-      createdAt: Date.now(),
-    };
-    topic.messages.push(userMessage);
-    topic.updatedAt = Date.now();
-    await this.deps.repo.put(topic);
-    if (!alive()) {
-      this.finish(alive);
-      return;
-    }
-    this.deps.onTopic(topic);
-
     const boardWasEmpty = boardIsEmpty(topic);
     const svgAtStart = topic.svg;
     let toolSucceeded = false;
-    let toolActive = false;
     const recorder = new TraceRecorder(this.deps.modelId?.() ?? null);
-    const stream = (text: string | null, active: boolean) => {
-      if (alive()) this.deps.onStream(topicId, { text, toolActive: active, events: recorder.events });
+    recorder.trace.id = crypto.randomUUID();
+    recorder.trace.question = trimmed;
+    if (anchor) recorder.trace.selection = anchor;
+    const report = () => {
+      if (alive()) this.deps.onTrace(topicId, recorder.trace, false);
     };
     const tools = createWhiteboardTools({
       topicId,
@@ -235,105 +212,96 @@ export class Conversation {
         if (alive()) this.deps.onTopic(saved);
       },
       onToolStart: (name, input) => {
-        toolActive = true;
         recorder.toolStart(name, input);
-        stream(reply ? reply : null, true);
+        report();
       },
       onToolEnd: (name, outcome) => {
-        toolActive = false;
         recorder.toolEnd(name, outcome);
-        stream(reply, false);
+        report();
       },
     });
 
     let reply = "";
     let session: LanguageModelSession | null = null;
     try {
-      this.createdPrompts = null;
       const edited = this.nextPrompts.get(topicId);
       this.nextPrompts.delete(topicId);
-      session = edited
-        ? await this.createEdited(model, topic.id, edited, tools, abort.signal)
-        : await this.ensureSession(model, topic, trimmed, tools, abort.signal, alive);
+      const created = edited
+        ? await this.createEdited(model, topic, trimmed, anchor, edited, tools, abort.signal)
+        : await this.createFitted(model, topic, trimmed, anchor, tools, abort.signal, alive);
+      session = created.session;
       if (!alive()) return;
-      const sent = this.createdPrompts as PromptMessage[] | null;
       recorder.trace.request = {
-        newSession: sent !== null,
-        ...(sent ? { initialPrompts: sent.map((message) => ({ ...message, content: capText(message.content) })) } : {}),
-        prompt: trimmed,
+        initialPrompts: created.initialPrompts.map((message) => ({ ...message, content: capText(message.content) })),
+        prompt: capText(created.prompt),
+        ...(anchor ? { selection: anchor } : {}),
         ...(edited ? { edited: true } : {}),
       };
-      stream("", toolActive);
+      report();
       const onReasoning = (text: string) => {
         if (!alive() || abort.signal.aborted) return;
         recorder.addReasoning(text);
-        stream(reply, toolActive);
+        report();
       };
-      for await (const chunk of iterateText(session.promptStreaming(trimmed, { signal: abort.signal, onReasoning }))) {
+      for await (const chunk of iterateText(session.promptStreaming(created.prompt, { signal: abort.signal, onReasoning }))) {
         if (!alive() || abort.signal.aborted) break;
         reply += chunk;
         recorder.addText(chunk);
-        stream(reply, false);
+        report();
       }
       if (!alive()) return;
       if (abort.signal.aborted) throw Object.assign(new Error("Aborted"), { name: "AbortError" });
 
-      let assistant = reply;
       const dumpedSvg = extractBoardSvg(reply);
-      if (
-        shouldUseEmptyBoardFallback({
-          boardWasEmpty,
-          toolSucceeded,
-          aborted: false,
-          reply,
-        })
-      ) {
-        await this.persistHtml(topicId, reply);
+      if (shouldUseEmptyBoardFallback({ boardWasEmpty, toolSucceeded, aborted: false, reply })) {
+        await this.persist(topicId, (fresh) => {
+          fresh.html = reply;
+          const title = titleFromHtml(reply);
+          if (title) fresh.title = title;
+        });
         toolSucceeded = true;
-        assistant = FALLBACK_ASSISTANT;
         recorder.trace.rawReply = reply;
         recorder.trace.fallback = "html";
-        stream(assistant, false);
       } else if (dumpedSvg) {
         const current = await this.deps.repo.get(topicId);
         if (current && current.svg === svgAtStart) {
-          await this.persistSvg(topicId, dumpedSvg);
+          await this.persist(topicId, (fresh) => {
+            fresh.svg = dumpedSvg;
+          });
           toolSucceeded = true;
+          recorder.trace.rawReply = reply;
           recorder.trace.fallback = "svg";
-          if (boardWasEmpty || replyIsToolDump(reply)) {
-            assistant = FALLBACK_ASSISTANT;
-            recorder.trace.rawReply = reply;
-            stream(assistant, false);
-          }
         }
+      } else if (!toolSucceeded && !boardWasEmpty && options.note !== false && reply.trim() && !replyIsToolDump(reply)) {
+        await this.persist(topicId, (fresh) => {
+          fresh.html = insertNote(sourcesOf(fresh), anchor, { question: trimmed, reply: reply.trim() });
+        });
+        toolSucceeded = true;
+        recorder.trace.rawReply = reply;
+        recorder.trace.fallback = "note";
       }
-
       this.measure(recorder, session);
-      await this.persistAssistant(topicId, assistant, recorder, alive);
-      if (alive()) this.deps.onStream(topicId, null);
-      if (toolSucceeded) this.destroySession();
+      if (!toolSucceeded) {
+        recorder.trace.error = NOTHING_CHANGED;
+        this.deps.onError(NOTHING_CHANGED);
+      }
     } catch (error) {
       if (!alive()) return;
-      this.deps.onStream(topicId, null);
       const note = errorNote(error);
       if (note) this.deps.onError(note);
-      // Keep the failed turn's trace; an empty message is hidden in the chat and the prompt.
       const err = error as { name?: string; message?: string };
       recorder.trace.error = err?.name === "AbortError" ? "Stopped" : note ?? err?.message ?? "The request failed.";
       this.measure(recorder, session);
-      await this.persistAssistant(topicId, "", recorder, alive).catch(() => {});
-      if (err?.name === "InvalidStateError") this.destroySession();
     } finally {
+      session?.destroy();
+      recorder.finish();
+      if (alive()) this.deps.onTrace(topicId, recorder.trace, true);
       this.finish(alive);
     }
   }
 
   private finish(alive: () => boolean): void {
     if (!alive()) return;
-    if (this.resetAfterTurn) {
-      this.resetAfterTurn = false;
-      this.destroySession();
-    }
     this.busy = false;
     this.abort = null;
     this.deps.onBusy(false);
@@ -344,110 +312,54 @@ export class Conversation {
     if (typeof session?.inputQuota === "number") recorder.trace.inputQuota = session.inputQuota;
   }
 
-  private async persistAssistant(
-    topicId: string,
-    content: string,
-    recorder: TraceRecorder,
-    alive: () => boolean,
-  ): Promise<void> {
-    const fresh = await this.deps.repo.get(topicId);
-    if (!fresh || !alive()) return;
-    fresh.messages.push({
-      id: crypto.randomUUID(),
-      role: "assistant",
-      content,
-      createdAt: Date.now(),
-      trace: recorder.finish(),
-    });
-    fresh.updatedAt = Date.now();
-    await this.deps.repo.put(fresh);
-    this.deps.onTopic(fresh);
-  }
-
-  private async persistSvg(topicId: string, svg: string): Promise<void> {
+  /** Change the stored topic in place, if it is still the open one. */
+  private async persist(topicId: string, change: (topic: TopicRecord) => void): Promise<void> {
     if (this.deps.getOpenTopicId() !== topicId) throw new Error("This topic is no longer open.");
     const topic = await this.deps.repo.get(topicId);
     if (!topic) throw new Error("This topic is no longer open.");
-    topic.svg = svg;
+    change(topic);
     topic.updatedAt = Date.now();
     await this.deps.repo.put(topic);
     this.deps.onTopic(topic);
   }
 
-  private async persistHtml(topicId: string, html: string): Promise<void> {
-    if (this.deps.getOpenTopicId() !== topicId) throw new Error("This topic is no longer open.");
-    const topic = await this.deps.repo.get(topicId);
-    if (!topic) throw new Error("This topic is no longer open.");
-    topic.html = html;
-    const title = titleFromHtml(html);
-    if (title) topic.title = title;
-    topic.updatedAt = Date.now();
-    await this.deps.repo.put(topic);
-    this.deps.onTopic(topic);
+  private options(tools: ToolDeclaration[], signal: AbortSignal, initialPrompts: PromptMessage[]): CreateOptions {
+    const modelId = this.deps.modelId?.() ?? null;
+    return { initialPrompts, tools, signal, reasoning: true, ...(modelId ? { model: modelId } : {}) };
   }
 
-  /** A new session from initial prompts edited in Debug mode, sent as they are. */
+  /** A session from initial prompts edited in Debug mode, sent as they are. */
   private async createEdited(
     model: LanguageModelAPI,
-    topicId: string,
+    topic: TopicRecord,
+    question: string,
+    anchor: SelectionAnchor | null,
     initialPrompts: PromptMessage[],
     tools: ToolDeclaration[],
     signal: AbortSignal,
-  ): Promise<LanguageModelSession> {
-    this.destroySession();
-    const modelId = this.deps.modelId?.() ?? null;
-    const created = await model.create({
-      initialPrompts,
-      tools,
-      signal,
-      reasoning: true,
-      ...(modelId ? { model: modelId } : {}),
-    });
-    this.session = created;
-    this.sessionTopicId = topicId;
-    this.createdPrompts = initialPrompts;
-    return created;
+  ): Promise<{ session: LanguageModelSession; initialPrompts: PromptMessage[]; prompt: string }> {
+    const { prompt } = this.build(topic, question, anchor);
+    const session = await model.create(this.options(tools, signal, initialPrompts));
+    return { session, initialPrompts, prompt };
   }
 
-  private async ensureSession(
+  /** A session whose system prompt fits: the stored material is cut down until the model accepts it. */
+  private async createFitted(
     model: LanguageModelAPI,
     topic: TopicRecord,
-    userText: string,
+    question: string,
+    anchor: SelectionAnchor | null,
     tools: ToolDeclaration[],
     signal: AbortSignal,
     alive: () => boolean,
-  ): Promise<LanguageModelSession> {
-    if (this.session && this.sessionTopicId === topic.id) return this.session;
-
-    this.destroySession();
-    const prior = topic.messages.slice(0, -1);
+  ): Promise<{ session: LanguageModelSession; initialPrompts: PromptMessage[]; prompt: string }> {
     let maxFullSections: number | undefined;
-    let created: LanguageModelSession | null = null;
-
     for (let attempt = 0; attempt < 5; attempt += 1) {
       if (!alive()) throw Object.assign(new Error("Aborted"), { name: "AbortError" });
-      const built = buildPrompt({
-        sources: {
-          html: topic.html,
-          css: topic.css,
-          js: topic.js,
-          svg: topic.svg,
-          json: topic.json,
-        },
-        materialMarkdown: topic.materialMarkdown,
-        messages: prior,
-        contextTokens: this.deps.contextTokens?.(),
-        maxFullSections,
-        systemOverride: topic.systemPrompt,
-      });
-      const initialPrompts = [{ role: "system" as const, content: built.system }, ...built.history];
-      const modelId = this.deps.modelId?.() ?? null;
-      created = await model.create({
-        initialPrompts,
-        tools,
-        signal,
-        reasoning: true,
-        ...(modelId ? { model: modelId } : {}),
+      const built = this.build(topic, question, anchor, maxFullSections);
+      const initialPrompts: PromptMessage[] = [{ role: "system", content: built.system }];
+      const session = await model.create({
+        ...this.options(tools, signal, initialPrompts),
         monitor: (monitor) => {
           monitor.addEventListener("downloadprogress", (event) => {
             const loaded = (event as Event & { loaded?: number }).loaded;
@@ -455,43 +367,23 @@ export class Conversation {
           });
         },
       });
-      this.session = created;
-      this.sessionTopicId = topic.id;
-      this.createdPrompts = initialPrompts;
-
-      if (!created.measureInputUsage) return created;
-      const assembled = [...initialPrompts.map((message) => message.content), userText].join("\n");
-      const measured = await created.measureInputUsage(assembled);
-      const quota = created.inputQuota ?? this.deps.contextTokens?.() ?? 8192;
+      const result = { session, initialPrompts, prompt: built.prompt };
+      if (!session.measureInputUsage) return result;
+      const assembled = `${built.system}\n${built.prompt}`;
+      const measured = await session.measureInputUsage(assembled);
+      const quota = session.inputQuota ?? this.deps.contextTokens?.() ?? 8192;
       const limit = Math.max(1, quota - 1500);
-      if (measured <= limit) return created;
+      if (measured <= limit) return result;
 
-      created.destroy();
-      this.session = null;
-      this.sessionTopicId = null;
-      const lesson = parseLesson(topic.materialMarkdown);
-      const currentCap = maxFullSections ?? lesson.sections.length;
-      if (currentCap <= 0 && built.history.length === 0) {
-        const oversized = await model.create({
-          initialPrompts,
-          tools,
-          signal,
-          reasoning: true,
-          ...(modelId ? { model: modelId } : {}),
-        });
-        this.session = oversized;
-        this.sessionTopicId = topic.id;
-        return oversized;
-      }
+      const currentCap = maxFullSections ?? parseLesson(topic.materialMarkdown).sections.length;
+      // Nothing left to cut: send it and let the model report the quota.
+      if (currentCap <= 0) return result;
+      session.destroy();
       maxFullSections = Math.floor(currentCap / 2);
-      if (estimateTokens(assembled) <= limit && measured > limit) {
-        maxFullSections = Math.max(0, (maxFullSections ?? 0) - 1);
-      }
+      if (estimateTokens(assembled) <= limit) maxFullSections = Math.max(0, maxFullSections - 1);
     }
 
-    throw Object.assign(new Error("The lesson or the conversation is over the model's limit."), {
-      name: "QuotaExceededError",
-    });
+    throw Object.assign(new Error("The lesson is over the model's limit."), { name: "QuotaExceededError" });
   }
 }
 

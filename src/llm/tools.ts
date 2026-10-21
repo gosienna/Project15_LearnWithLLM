@@ -1,6 +1,6 @@
 import type { TopicRepository } from "../storage/db.ts";
 import { BOARD_COMPONENTS, type BoardComponent, type BoardSources, type ToolDeclaration, type TopicRecord } from "../types.ts";
-import { snapshotBoard, titleFromHtml } from "../ui/whiteboard.ts";
+import { SELECTION_END, SELECTION_START, snapshotBoard, titleFromHtml } from "../ui/whiteboard.ts";
 
 export const SOURCE_CHAR_LIMIT = 200_000;
 export const VIEW_ALL_CHAR_LIMIT = 24_000;
@@ -203,16 +203,18 @@ export function createWhiteboardTools(host: ToolHost): ToolDeclaration[] {
             throw new Error("json must be empty or a JSON string.");
           }
         }
+        // The model reads the source with the selection marked; a copied marker must not reach the page.
+        const source = args.source.replaceAll(SELECTION_START, "").replaceAll(SELECTION_END, "");
         const topic = await loadTopic(host);
-        topic[args.component] = args.source;
+        topic[args.component] = source;
         if (args.component === "html") {
-          const title = titleFromHtml(args.source);
+          const title = titleFromHtml(source);
           if (title) topic.title = title;
         }
         await saveTopic(host, topic);
         const result: { component: BoardComponent; characters: number; title?: string } = {
           component: args.component,
-          characters: args.source.length,
+          characters: source.length,
         };
         if (args.component === "html") result.title = topic.title;
         return result;

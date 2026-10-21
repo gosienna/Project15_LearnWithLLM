@@ -1,28 +1,39 @@
 import { loadBackendStatus, readSavedModelId, writeSavedModelId, type BackendStatus } from "./llm/backend.ts";
-import { Conversation, type StreamState } from "./llm/turn.ts";
+import { Tutor } from "./llm/turn.ts";
 import { createEmptyTopic, createRepository, openDatabase, type TopicRepository } from "./storage/db.ts";
-import type { TopicRecord } from "./types.ts";
-import { renderDialogue, type DialogueView } from "./ui/dialogue.ts";
+import type { SelectionAnchor, TopicRecord, TurnTrace } from "./types.ts";
+import { renderAskPopover, type AskPopover } from "./ui/ask-popover.ts";
 import { renderSystemPanel } from "./ui/system.ts";
 import { readMode, writeMode, type UiMode } from "./ui/mode.ts";
 import { applyMode, renderShell, setTopicsOpen, type Shell } from "./ui/shell.ts";
 import { renderSources, type PromptInputs } from "./ui/sources.ts";
 import { renderTopics } from "./ui/topics.ts";
-import { boardIsEmpty, renderWhiteboard } from "./ui/whiteboard.ts";
+import {
+  boardDraft,
+  boardIsEmpty,
+  clearBoardHighlight,
+  focusStart,
+  renderWhiteboard,
+  syncStartForm,
+} from "./ui/whiteboard.ts";
 import "./styles.css";
 
 interface AppController {
   repo: TopicRepository;
   shell: Shell;
-  dialogue: DialogueView;
+  popover: AskPopover;
   topics: TopicRecord[];
   activeId: string;
-  stream: { topicId: string; state: StreamState } | null;
   error: string | null;
   busy: boolean;
   status: BackendStatus;
-  conversation: Conversation;
+  tutor: Tutor;
   mode: UiMode;
+  /** This visit's asks on the open topic, newest first. Never saved. */
+  traces: TurnTrace[];
+  liveTraceId: string | null;
+  /** Listeners for the Next request tab: the question or the selection changed. */
+  draftListeners: Set<() => void>;
 }
 
 function activeTopic(app: AppController): TopicRecord | undefined {
@@ -32,10 +43,28 @@ function activeTopic(app: AppController): TopicRecord | undefined {
 export const STORE_MATERIAL_PROMPT =
   "Store the current whiteboard as the learning material. Write a markdown document of what the page teaches and call whiteboard_store_material. Do not change the html, css, js, svg, or json.";
 
-function syncStoreButton(app: AppController): void {
+function syncControls(app: AppController): void {
   const topic = activeTopic(app);
   const empty = !topic || boardIsEmpty(topic);
-  app.shell.storeMaterial.disabled = app.busy || empty;
+  const ready = app.status.composerEnabled;
+  app.shell.storeMaterial.disabled = app.busy || empty || !ready;
+  app.shell.stop.hidden = !app.busy;
+  app.shell.modelName.textContent = app.status.header;
+  app.shell.modelStatus.textContent = app.status.detail;
+  app.shell.error.hidden = !app.error;
+  app.shell.error.textContent = app.error ?? "";
+  syncStartForm(app.shell.board, { enabled: ready, busy: app.busy });
+  app.popover.setEnabled(ready);
+  app.popover.setBusy(app.busy);
+}
+
+function notifyDraft(app: AppController): void {
+  for (const listener of app.draftListeners) listener();
+}
+
+/** The question the next ask sends: the open panel's, or the start form's on an empty board. */
+function pendingQuestion(app: AppController): string {
+  return app.popover.isOpen() ? app.popover.question() : boardDraft(app.shell.board);
 }
 
 function paint(app: AppController): void {
@@ -52,36 +81,58 @@ function paint(app: AppController): void {
     svg: topic?.svg ?? "",
     json: topic?.json ?? "",
   };
-  renderWhiteboard(app.shell.board, sources);
+  renderWhiteboard(app.shell.board, sources, {
+    onStart: (question) => void ask(app, question, null),
+    onSelection: (anchor) => onSelection(app, anchor),
+    onDraft: () => notifyDraft(app),
+  });
   renderSources(
-    { tabs: app.shell.boardTabs, board: app.shell.board, pane: app.shell.sources },
+    { tabs: app.shell.boardTabs, board: app.shell.boardArea, pane: app.shell.sources },
     { ...sources, material: topic?.materialMarkdown ?? "" },
     app.mode,
     topic ? promptInputs(app, topic) : undefined,
   );
-  app.dialogue.renderTranscript(
-    topic?.messages ?? [],
-    app.stream && app.stream.topicId === app.activeId ? app.stream.state : null,
-    app.mode,
-  );
-  app.dialogue.setError(app.error);
-  app.dialogue.setBusy(app.busy);
-  app.dialogue.setComposerEnabled(app.status.composerEnabled);
-  app.dialogue.setStatus(app.status.header, app.status.detail);
-  syncStoreButton(app);
+  syncControls(app);
+}
+
+function onSelection(app: AppController, anchor: SelectionAnchor | null): void {
+  if (anchor) {
+    app.popover.show(anchor);
+    return;
+  }
+  // A click elsewhere on the board closes an empty panel and keeps a typed question.
+  if (!app.popover.question().trim()) app.popover.hide();
+}
+
+async function ask(app: AppController, question: string, anchor: SelectionAnchor | null): Promise<void> {
+  if (anchor) app.popover.setStatus("Updating the board…");
+  await app.tutor.ask(app.activeId, question, { anchor });
+  if (!anchor) return;
+  if (app.error) {
+    app.popover.setStatus(app.error);
+    return;
+  }
+  app.popover.hide();
+  clearBoardHighlight(app.shell.board);
 }
 
 function promptInputs(app: AppController, topic: TopicRecord): PromptInputs {
   return {
     topicId: topic.id,
-    system: () => app.conversation.previewSystem(topic),
-    request: () => app.conversation.previewRequest(topic),
-    prompt: () => app.dialogue.draft(),
-    subscribePrompt: (listener) => app.dialogue.subscribeDraft(listener),
+    system: () => app.tutor.previewSystem(topic),
+    request: () => app.tutor.previewRequest(topic),
+    prompt: () => app.tutor.previewPrompt(topic, pendingQuestion(app), app.popover.anchor()),
+    selection: () => app.popover.anchor(),
+    subscribePrompt: (listener) => {
+      app.draftListeners.add(listener);
+      return () => app.draftListeners.delete(listener);
+    },
+    traces: () => app.traces,
+    liveTraceId: () => app.liveTraceId,
     onPinSystem: (text) => void pinSystemPrompt(app, topic.id, text),
     onUnpinSystem: () => void pinSystemPrompt(app, topic.id, undefined),
     onSetRequest: (prompts) => {
-      app.conversation.setNextRequest(topic.id, prompts);
+      app.tutor.setNextRequest(topic.id, prompts);
       paint(app);
     },
   };
@@ -94,7 +145,6 @@ async function pinSystemPrompt(app: AppController, topicId: string, text: string
   else topic.systemPrompt = text;
   topic.updatedAt = Date.now();
   await app.repo.put(topic);
-  if (app.activeId === topicId) app.conversation.resetSession();
   upsert(app, topic);
   paint(app);
 }
@@ -114,17 +164,25 @@ function upsert(app: AppController, topic: TopicRecord): void {
   app.topics.sort((a, b) => b.updatedAt - a.updatedAt || b.createdAt - a.createdAt);
 }
 
-async function createTopic(app: AppController): Promise<void> {
-  app.conversation.cancelForSwitch();
-  app.stream = null;
+/** Leave the open topic: stop its ask and forget this visit's selection and traces. */
+function leaveTopic(app: AppController): void {
+  app.tutor.cancelForSwitch();
   app.error = null;
+  app.busy = false;
+  app.traces = [];
+  app.liveTraceId = null;
+  app.popover.hide();
+}
+
+async function createTopic(app: AppController): Promise<void> {
+  leaveTopic(app);
   const topic = createEmptyTopic();
   await app.repo.put(topic);
   upsert(app, topic);
   app.activeId = topic.id;
   setTopicsOpen(app.shell, false);
   paint(app);
-  app.dialogue.focus();
+  focusStart(app.shell.board);
 }
 
 async function selectTopic(app: AppController, id: string): Promise<void> {
@@ -132,10 +190,7 @@ async function selectTopic(app: AppController, id: string): Promise<void> {
     setTopicsOpen(app.shell, false);
     return;
   }
-  app.conversation.cancelForSwitch();
-  app.stream = null;
-  app.error = null;
-  app.busy = false;
+  leaveTopic(app);
   app.activeId = id;
   const topic = await app.repo.get(id);
   if (topic) upsert(app, topic);
@@ -148,12 +203,7 @@ async function deleteTopic(app: AppController, id: string): Promise<void> {
   const title = topic?.title || "New topic";
   if (!window.confirm(`Delete “${title}”?`)) return;
   const deletingActive = id === app.activeId;
-  if (deletingActive) {
-    app.conversation.cancelForSwitch();
-    app.stream = null;
-    app.error = null;
-    app.busy = false;
-  }
+  if (deletingActive) leaveTopic(app);
   await app.repo.delete(id);
   app.topics = app.topics.filter((item) => item.id !== id);
   if (!deletingActive) {
@@ -174,24 +224,23 @@ async function deleteTopic(app: AppController, id: string): Promise<void> {
 
 async function refreshStatus(app: AppController): Promise<void> {
   app.status = await loadBackendStatus(window, readSavedModelId());
-  app.dialogue.setStatus(app.status.header, app.status.detail);
-  app.dialogue.setComposerEnabled(app.status.composerEnabled);
-  syncStoreButton(app);
+  syncControls(app);
 }
 
 export async function boot(root: HTMLElement): Promise<void> {
   const shell = renderShell(root);
-  const dialogue = renderDialogue(shell.dialogue, {
-    onSend: (text) => void app.conversation.send(app.activeId, text),
-    onStop: () => app.conversation.stop(),
+  let app: AppController;
+  const popover = renderAskPopover(shell.boardArea, {
+    onAsk: (question, anchor) => void ask(app, question, anchor),
+    onCancel: () => clearBoardHighlight(shell.board),
+    onInput: () => notifyDraft(app),
   });
   shell.storeMaterial.addEventListener("click", () => {
-    void app.conversation.send(app.activeId, STORE_MATERIAL_PROMPT);
+    void app.tutor.ask(app.activeId, STORE_MATERIAL_PROMPT, { note: false });
   });
+  shell.stop.addEventListener("click", () => app.tutor.stop());
   const system = renderSystemPanel((id) => {
-    const previous = app.status.chosen?.id ?? null;
     writeSavedModelId(id);
-    if (id !== previous) app.conversation.destroySession();
     void refreshStatus(app);
   });
   shell.systemButton.addEventListener("click", () => {
@@ -200,7 +249,6 @@ export async function boot(root: HTMLElement): Promise<void> {
     });
   });
 
-  let app: AppController;
   const repo = createRepository(await openDatabase());
   const topics = await repo.list();
   let active = topics[0];
@@ -213,10 +261,9 @@ export async function boot(root: HTMLElement): Promise<void> {
   app = {
     repo,
     shell,
-    dialogue,
+    popover,
     topics,
     activeId: active.id,
-    stream: null,
     error: null,
     busy: false,
     status: {
@@ -228,8 +275,11 @@ export async function boot(root: HTMLElement): Promise<void> {
       modelNote: null,
       chosen: null,
     },
-    conversation: undefined as unknown as Conversation,
+    tutor: undefined as unknown as Tutor,
     mode: readMode(),
+    traces: [],
+    liveTraceId: null,
+    draftListeners: new Set(),
   };
   applyMode(shell, app.mode);
   shell.modeButtons.clean.addEventListener("click", () => setMode(app, "clean"));
@@ -241,7 +291,7 @@ export async function boot(root: HTMLElement): Promise<void> {
     setMode(app, app.mode === "debug" ? "clean" : "debug");
   });
 
-  app.conversation = new Conversation({
+  app.tutor = new Tutor({
     repo,
     languageModel: () => app.status.model,
     modelId: () => app.status.chosen?.id ?? null,
@@ -251,27 +301,29 @@ export async function boot(root: HTMLElement): Promise<void> {
       upsert(app, topic);
       paint(app);
     },
-    onStream: (topicId, state) => {
-      app.stream = state ? { topicId, state } : null;
-      paint(app);
+    onTrace: (topicId, trace, done) => {
+      if (topicId !== app.activeId) return;
+      if (!app.traces.includes(trace)) app.traces.unshift(trace);
+      app.liveTraceId = done ? null : trace.id ?? null;
+      if (app.mode === "debug") paint(app);
     },
     onError: (message) => {
       app.error = message;
-      dialogue.setError(message);
+      syncControls(app);
     },
     onBusy: (busy) => {
       app.busy = busy;
-      dialogue.setBusy(busy);
-      syncStoreButton(app);
+      syncControls(app);
     },
     onDownload: (ratio) => {
       if (ratio === null) return;
       app.status = { ...app.status, detail: `Downloading ${Math.round(ratio * 100)}%` };
-      dialogue.setStatus(app.status.header, app.status.detail);
+      syncControls(app);
     },
   });
 
   paint(app);
+  focusStart(shell.board);
   await refreshStatus(app);
   window.addEventListener("focus", () => void refreshStatus(app));
 }

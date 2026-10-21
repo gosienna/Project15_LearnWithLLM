@@ -1,5 +1,5 @@
 import { WHITEBOARD_TOOL_SPECS } from "../llm/tools.ts";
-import type { PromptMessage } from "../types.ts";
+import type { PromptMessage, SelectionAnchor } from "../types.ts";
 import { createJsonTreeState, renderJsonTree, type JsonTreeState } from "./json-tree.ts";
 
 export interface SystemPromptState {
@@ -8,7 +8,6 @@ export interface SystemPromptState {
 }
 
 export interface RequestPreview {
-  newSession: boolean;
   edited: boolean;
   initialPrompts: PromptMessage[];
 }
@@ -22,7 +21,7 @@ export interface EditorHandlers {
 const promptWatch = new WeakMap<HTMLElement, () => void>();
 const treeState = new WeakMap<HTMLElement, JsonTreeState>();
 
-/** Drop the composer listener when the request tab is no longer showing. */
+/** Drop the prompt listener when the request tab is no longer showing. */
 export function releaseRequestEditor(pane: HTMLElement): void {
   promptWatch.get(pane)?.();
   promptWatch.delete(pane);
@@ -71,7 +70,7 @@ export function renderSystemEditor(
   const status = note(
     state.pinned
       ? "Pinned to this topic. The board status and stored material no longer update in it."
-      : "Automatic. Built from the instructions, the board, and the stored material for each new session.",
+      : "Automatic. Built from the instructions, the board, and the stored material for each ask.",
     `editor-status${state.pinned ? " is-pinned" : ""}`,
   );
   const field = document.createElement("textarea");
@@ -114,7 +113,7 @@ export function renderSystemEditor(
     status,
     field,
     actions,
-    note(`${state.text.length} characters. Changes apply from the next new session; the next send starts one.`),
+    note(`${state.text.length} characters. Every ask starts a new session, so changes apply from the next ask.`),
   );
 }
 
@@ -124,8 +123,10 @@ export function renderRequestEditor(
   handlers: EditorHandlers & {
     onUse: (prompts: PromptMessage[]) => void;
     onDiscard: () => void;
-    /** The composer text the next send passes as `prompt`. */
+    /** The prompt the next ask sends: the selection and its source, then the question. */
     prompt?: () => string;
+    /** Where the learner pointed for the next ask, if anywhere. */
+    selection?: () => SelectionAnchor | null;
     subscribePrompt?: (listener: () => void) => () => void;
   },
 ): void {
@@ -135,10 +136,8 @@ export function renderRequestEditor(
 
   const status = note(
     preview.edited
-      ? "Edited. The next send starts a new session from these messages, then sends your typed message as the prompt. The edit is used once."
-      : preview.newSession
-        ? "The next send starts a new session from these messages, then sends your typed message as the prompt."
-        : "The session is reused, so the next send sends only your typed message. The session was created from messages like these; use an edited copy to start a new session from it.",
+      ? "Edited. The next ask starts its session from these messages, then sends the prompt. The edit is used once."
+      : "Every ask starts a new session from these messages, then sends the prompt: the selection and the source around it, then the question. Nothing from earlier asks is sent.",
     `editor-status${preview.edited ? " is-pinned" : ""}`,
   );
 
@@ -174,11 +173,15 @@ export function renderRequestEditor(
   });
   discard.disabled = !preview.edited;
 
-  const payload = () => ({
-    initialPrompts: rows,
-    prompt: promptText(),
-    tools: WHITEBOARD_TOOL_SPECS,
-  });
+  const payload = () => {
+    const selection = handlers.selection?.() ?? null;
+    return {
+      initialPrompts: rows,
+      prompt: promptText(),
+      ...(selection ? { selection } : {}),
+      tools: WHITEBOARD_TOOL_SPECS,
+    };
+  };
 
   const rawJson = () => JSON.stringify(payload(), null, 2);
 
@@ -292,7 +295,7 @@ export function renderRequestEditor(
   edit.append(
     editLabel,
     json,
-    note("Only initialPrompts is editable here. prompt is the composer text. tools are the declarations sent with the session."),
+    note("Only initialPrompts is editable here. prompt is built from the open question and selection. tools are the declarations sent with the session."),
     apply,
   );
   raw.append(rawLabel, treeHost, edit);

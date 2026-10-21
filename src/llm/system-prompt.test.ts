@@ -1,24 +1,84 @@
+// @vitest-environment happy-dom
 import { describe, expect, it } from "vitest";
 import { serializeLesson } from "../document/markdown.ts";
-import { emptyBoard } from "../ui/whiteboard.ts";
-import { buildPrompt, estimateTokens, whiteboardPreface, WHITEBOARD_PLACEHOLDER } from "./system-prompt.ts";
+import type { SelectionAnchor } from "../types.ts";
+import { emptyBoard, SELECTION_END, SELECTION_START } from "../ui/whiteboard.ts";
+import { buildPrompt, estimateTokens, INSTRUCTIONS, sourceWindow, whiteboardPreface } from "./system-prompt.ts";
+
+function anchor(overrides: Partial<SelectionAnchor> = {}): SelectionAnchor {
+  return {
+    kind: "text",
+    component: "html",
+    selector: "body > p:nth-of-type(1)",
+    tag: "p",
+    quote: { exact: "chlorophyll", prefix: "Leaves hold ", suffix: " in their cells." },
+    outerHTML: "<p>Leaves hold chlorophyll in their cells.</p>",
+    rect: { x: 10, y: 20, width: 80, height: 16 },
+    ...overrides,
+  };
+}
 
 describe("system prompt", () => {
-  it("describes an empty board without the placeholder sentence", () => {
-    const { system } = buildPrompt({ sources: emptyBoard(), materialMarkdown: "   ", messages: [] });
+  it("describes an empty board and sends the question as it is", () => {
+    const { system, prompt } = buildPrompt({ sources: emptyBoard(), materialMarkdown: "   ", question: "Teach me cells" });
+    expect(system.startsWith(INSTRUCTIONS)).toBe(true);
     expect(system).toContain("The whiteboard is empty.");
-    expect(system).toContain("whiteboard_set");
     expect(system).toContain("lessonData");
-    expect(system).not.toContain(WHITEBOARD_PLACEHOLDER);
-    expect(system).not.toContain("The lesson will appear here.");
     expect(system).not.toContain("# Stored learning material");
+    expect(prompt).toBe("Teach me cells");
   });
 
-  it("reports source lengths and does not inline the page", () => {
+  it("reports source lengths and does not inline the page without a selection", () => {
     const sources = { ...emptyBoard(), html: "<h1>Photosynthesis</h1><p>Leaves.</p>" };
-    const { system } = buildPrompt({ sources, materialMarkdown: "", messages: [] });
+    const { system, prompt } = buildPrompt({ sources, materialMarkdown: "", question: "Summarize" });
     expect(system).toContain(`html: ${sources.html.length} characters`);
     expect(system).not.toContain("Leaves.");
+    expect(prompt).toBe("Summarize");
+  });
+
+  it("puts the selection, the marked source, and the question in the prompt", () => {
+    const sources = { ...emptyBoard(), html: "<h1>Photosynthesis</h1><p>Leaves hold chlorophyll in their cells.</p><p>Roots.</p>" };
+    const { system, prompt } = buildPrompt({ sources, materialMarkdown: "", question: "What is this?", anchor: anchor() });
+    expect(system).not.toContain("chlorophyll");
+    expect(prompt).toContain("# Selection");
+    expect(prompt).toContain("selector: body > p:nth-of-type(1)");
+    expect(prompt).toContain("…Leaves hold [[chlorophyll]] in their cells.…");
+    expect(prompt).toContain(`${SELECTION_START}<p>Leaves hold chlorophyll in their cells.</p>${SELECTION_END}<p>Roots.</p>`);
+    expect(prompt.trim().endsWith("# Question\nWhat is this?")).toBe(true);
+  });
+
+  it("says so when the selector is not in the stored source", () => {
+    const sources = { ...emptyBoard(), html: "<div id='app'></div>" };
+    const { prompt } = buildPrompt({
+      sources,
+      materialMarkdown: "",
+      question: "Why?",
+      anchor: anchor({ selector: "#app > button:nth-of-type(2)", tag: "button" }),
+    });
+    expect(prompt).toContain("did not match the stored source");
+    expect(prompt).not.toContain(SELECTION_START);
+  });
+
+  it("marks an svg element inside the svg source", () => {
+    const sources = { ...emptyBoard(), html: "<p>Text</p>", svg: '<svg width="10" height="10"><rect></rect><text>Sun</text></svg>' };
+    const { prompt } = buildPrompt({
+      sources,
+      materialMarkdown: "",
+      question: "Explain",
+      anchor: anchor({ component: "svg", selector: "#lesson-svg > svg:nth-of-type(1) > text:nth-of-type(1)", tag: "text" }),
+    });
+    expect(prompt).toContain("# Source: svg");
+    expect(prompt).toContain(`${SELECTION_START}<text>Sun</text>${SELECTION_END}`);
+    expect(prompt).not.toContain("<p>Text</p>");
+  });
+
+  it("keeps a window of a long source around the selection", () => {
+    const text = `${"a".repeat(5000)}${SELECTION_START}X${SELECTION_END}${"b".repeat(5000)}`;
+    const window = sourceWindow(text, 1000);
+    expect(window).toContain(`${SELECTION_START}X${SELECTION_END}`);
+    expect(window).toContain("characters before");
+    expect(window).toContain("characters after");
+    expect(window.length).toBeLessThan(1100);
   });
 
   it("turns a stored lesson that exceeds the budget into an outline plus a prefix", () => {
@@ -31,12 +91,11 @@ describe("system prompt", () => {
     const markdown = serializeLesson({ title: "Quadratics", preamble: "", sections });
     const firstOnly = serializeLesson({ title: "Quadratics", preamble: "", sections: [sections[0]] });
     const header = whiteboardPreface("The whiteboard is empty.", true);
-    const headerTokens = estimateTokens(header);
-    const contextTokens = 1500 + headerTokens + estimateTokens(firstOnly) + 120;
+    const contextTokens = 1500 + estimateTokens(header) + estimateTokens(firstOnly) + 120;
     const { system } = buildPrompt({
       sources: emptyBoard(),
       materialMarkdown: markdown,
-      messages: [],
+      question: "Go on",
       contextTokens,
       reservedTokens: 1500,
     });
@@ -45,24 +104,18 @@ describe("system prompt", () => {
     expect(system).toContain("Omitted section ids:");
     expect(system).toContain("part-4");
     expect(system).toContain("shortened to fit the context window");
-    expect(system).not.toContain(WHITEBOARD_PLACEHOLDER);
   });
 
-  it("uses a pinned system prompt as it is and still builds the history", () => {
-    const { system, history } = buildPrompt({
-      sources: { ...emptyBoard(), html: "<h1>Cells</h1>" },
+  it("uses a pinned system prompt as it is and still builds the selection prompt", () => {
+    const sources = { ...emptyBoard(), html: "<p>Leaves hold chlorophyll in their cells.</p>" };
+    const { system, prompt } = buildPrompt({
+      sources,
       materialMarkdown: "",
-      messages: [
-        { id: "1", role: "user", content: "Hi", createdAt: 1 },
-        { id: "2", role: "assistant", content: "", createdAt: 2 },
-        { id: "3", role: "assistant", content: "Hello", createdAt: 3 },
-      ],
+      question: "Why green?",
+      anchor: anchor(),
       systemOverride: "You are a pirate tutor.",
     });
     expect(system).toBe("You are a pirate tutor.");
-    expect(history).toEqual([
-      { role: "user", content: "Hi" },
-      { role: "assistant", content: "Hello" },
-    ]);
+    expect(prompt).toContain(SELECTION_START);
   });
 });

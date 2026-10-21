@@ -48,16 +48,17 @@ describe("board source tabs", () => {
     const inputs = {
       topicId: "t1",
       system: () => system,
-      request: () => ({ newSession: true, edited: false, initialPrompts: [{ role: "system" as const, content: system.text }] }),
+      request: () => ({ edited: false, initialPrompts: [{ role: "system" as const, content: system.text }] }),
       onPinSystem: () => {},
       onUnpinSystem: () => {},
       onSetRequest: () => {},
     };
     renderSources(v, content, "debug", inputs);
     const tabs = [...v.tabs.querySelectorAll<HTMLButtonElement>(".board-tab")];
-    expect(tabs.at(-2)?.textContent).toBe("System prompt");
-    expect(tabs.at(-1)?.textContent).toBe("Next request");
-    tabs.at(-2)!.click();
+    expect(tabs.at(-3)?.textContent).toBe("System prompt");
+    expect(tabs.at(-2)?.textContent).toBe("Next request");
+    expect(tabs.at(-1)?.textContent).toBe("Trace0");
+    tabs.at(-3)!.click();
     const field = v.pane.querySelector("textarea")!;
     field.value = "Half-typed";
     field.dispatchEvent(new Event("input"));
@@ -68,6 +69,38 @@ describe("board source tabs", () => {
 
     renderSources(v, content, "debug", { ...inputs, topicId: "t2" });
     expect(v.pane.querySelector("textarea")?.value).toBe("Automatic two.");
+    renderSources(v, content, "clean", inputs);
+  });
+
+  it("lists this visit's asks, newest first, in the Trace tab", () => {
+    const v = view();
+    const traces = [
+      { id: "b", modelId: null, startedAt: 2, events: [], question: "Why green?", selection: {
+        kind: "text" as const, component: "html" as const, selector: "body > p:nth-of-type(1)", tag: "p",
+        quote: { exact: "chlorophyll", prefix: "", suffix: "" }, outerHTML: "<p></p>", rect: { x: 0, y: 0, width: 0, height: 0 },
+      } },
+      { id: "a", modelId: null, startedAt: 1, endedAt: 3, events: [], question: "Teach me leaves" },
+    ];
+    const inputs = {
+      topicId: "t1",
+      system: () => ({ text: "S", pinned: false }),
+      request: () => ({ edited: false, initialPrompts: [{ role: "system" as const, content: "S" }] }),
+      onPinSystem: () => {},
+      onUnpinSystem: () => {},
+      onSetRequest: () => {},
+      traces: () => traces,
+      liveTraceId: () => "b",
+    };
+    renderSources(v, content, "debug", inputs);
+    const tabs = [...v.tabs.querySelectorAll<HTMLButtonElement>(".board-tab")];
+    expect(tabs.at(-1)?.textContent).toBe("Trace2");
+    tabs.at(-1)!.click();
+    const entries = [...v.pane.querySelectorAll(".trace-entry")];
+    expect(entries.map((entry) => entry.querySelector(".trace-question")?.textContent)).toEqual(["Why green?", "Teach me leaves"]);
+    expect(entries[0]?.querySelector(".trace-selection")?.textContent).toContain("“chlorophyll” · body > p:nth-of-type(1)");
+    expect(entries[0]?.querySelector(".trace > summary")?.textContent).toContain("Running");
+    expect(entries[0]?.querySelector<HTMLDetailsElement>(".trace")?.open).toBe(true);
+    expect(entries[1]?.querySelector<HTMLDetailsElement>(".trace")?.open).toBe(false);
     renderSources(v, content, "clean", inputs);
   });
 });

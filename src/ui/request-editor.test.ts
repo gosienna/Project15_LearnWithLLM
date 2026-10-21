@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { describe, expect, it } from "vitest";
-import type { PromptMessage } from "../types.ts";
+import type { PromptMessage, SelectionAnchor } from "../types.ts";
 import { renderRequestEditor, renderSystemEditor, validatePrompts } from "./request-editor.ts";
 
 describe("initial prompt validation", () => {
@@ -17,6 +17,16 @@ describe("initial prompt validation", () => {
     expect(validatePrompts([{ role: "user", content: 3 }])).toContain("text content");
   });
 });
+
+const selection: SelectionAnchor = {
+  kind: "element",
+  component: "svg",
+  selector: "#lesson-svg > svg:nth-of-type(1)",
+  tag: "svg",
+  quote: { exact: "", prefix: "", suffix: "" },
+  outerHTML: "<svg></svg>",
+  rect: { x: 0, y: 0, width: 1, height: 1 },
+};
 
 describe("prompt editors", () => {
   const noop = { onDirty: () => {}, onDone: () => {} };
@@ -38,10 +48,10 @@ describe("prompt editors", () => {
     let dirty = 0;
     renderRequestEditor(
       pane,
-      { newSession: false, edited: false, initialPrompts: [{ role: "system", content: "S" }, { role: "user", content: "U" }] },
+      { edited: false, initialPrompts: [{ role: "system", content: "S" }, { role: "user", content: "U" }] },
       { onDirty: () => (dirty += 1), onDone: () => {}, onUse: (prompts) => used.push(prompts), onDiscard: () => {} },
     );
-    expect(pane.textContent).toContain("The session is reused");
+    expect(pane.textContent).toContain("Every ask starts a new session");
     const texts = pane.querySelectorAll<HTMLTextAreaElement>(".request-text");
     texts[1]!.value = "Edited user turn";
     texts[1]!.dispatchEvent(new Event("input"));
@@ -61,19 +71,20 @@ describe("prompt editors", () => {
     expect(used).toEqual([[{ role: "system", content: "S" }, { role: "user", content: "Edited user turn" }]]);
   });
 
-  it("shows the composer text and the tool declarations in the raw JSON", () => {
+  it("shows the prompt, the selection, and the tool declarations in the raw JSON", () => {
     const pane = document.createElement("section");
     document.body.append(pane);
     let draft = "What is a cell?";
     const listeners = new Set<() => void>();
     renderRequestEditor(
       pane,
-      { newSession: true, edited: false, initialPrompts: [{ role: "system", content: "Teach with the whiteboard." }] },
+      { edited: false, initialPrompts: [{ role: "system", content: "Teach with the whiteboard." }] },
       {
         ...noop,
         onUse: () => {},
         onDiscard: () => {},
         prompt: () => draft,
+        selection: () => (draft.startsWith("Draw") ? { ...selection } : null),
         subscribePrompt: (listener) => {
           listeners.add(listener);
           return () => listeners.delete(listener);
@@ -82,9 +93,11 @@ describe("prompt editors", () => {
     );
     const json = () => JSON.parse(pane.querySelector<HTMLTextAreaElement>(".request-json")!.value) as {
       prompt: string;
+      selection?: { selector: string };
       tools: { name: string; description: string; inputSchema: { properties?: Record<string, unknown> } }[];
     };
     expect(json().prompt).toBe("What is a cell?");
+    expect(json().selection).toBeUndefined();
     const view = json().tools.find((tool) => tool.name === "whiteboard_view");
     expect(view?.description).toContain("whiteboard source");
     expect(view?.inputSchema.properties).toHaveProperty("component");
@@ -108,6 +121,7 @@ describe("prompt editors", () => {
     draft = "Draw the membrane.";
     for (const listener of listeners) listener();
     expect(json().prompt).toBe("Draw the membrane.");
+    expect(json().selection?.selector).toBe("#lesson-svg > svg:nth-of-type(1)");
     expect(pane.querySelector('[data-path="prompt"]')?.textContent).toContain("Draw the membrane.");
     expect(pane.querySelector<HTMLDetailsElement>('[data-path="tools[0]"]')!.open).toBe(true);
     expect(pane.querySelector<HTMLDetailsElement>('[data-path="initialPrompts"]')!.open).toBe(false);

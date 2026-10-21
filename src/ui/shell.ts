@@ -7,10 +7,15 @@ export interface Shell {
   systemButton: HTMLButtonElement;
   storeMaterial: HTMLButtonElement;
   modeButtons: Record<UiMode, HTMLButtonElement>;
+  stop: HTMLButtonElement;
+  modelName: HTMLElement;
+  modelStatus: HTMLElement;
+  error: HTMLElement;
   boardTabs: HTMLElement;
+  /** Holds the board and the question panel over it; hidden while another debug tab is open. */
+  boardArea: HTMLElement;
   board: HTMLElement;
   sources: HTMLElement;
-  dialogue: HTMLElement;
 }
 
 export function renderShell(root: HTMLElement): Shell {
@@ -38,7 +43,14 @@ export function renderShell(root: HTMLElement): Shell {
   systemButton.type = "button";
   systemButton.className = "system-open";
   systemButton.textContent = "System";
-  toolbarStart.append(topicsToggle, systemButton);
+  const modelChip = document.createElement("div");
+  modelChip.className = "model-chip";
+  const modelName = document.createElement("p");
+  modelName.className = "model-name";
+  const modelStatus = document.createElement("p");
+  modelStatus.className = "model-status";
+  modelChip.append(modelName, modelStatus);
+  toolbarStart.append(topicsToggle, systemButton, modelChip);
   const storeMaterial = document.createElement("button");
   storeMaterial.type = "button";
   storeMaterial.className = "store-material";
@@ -60,14 +72,20 @@ export function renderShell(root: HTMLElement): Shell {
     return button;
   };
   const modeButtons: Record<UiMode, HTMLButtonElement> = {
-    clean: modeButton("clean", "Clean", "Only the lesson and the conversation"),
-    debug: modeButton("debug", "Debug", "Every step of each turn and the raw whiteboard (Ctrl+Shift+D)"),
+    clean: modeButton("clean", "Clean", "Only the lesson"),
+    debug: modeButton("debug", "Debug", "Every step of each ask and the raw whiteboard (Ctrl+Shift+D)"),
   };
   modeSwitch.append(modeButtons.clean, modeButtons.debug);
 
+  const stop = document.createElement("button");
+  stop.type = "button";
+  stop.className = "stop";
+  stop.textContent = "Stop";
+  stop.hidden = true;
+
   const toolbarEnd = document.createElement("div");
   toolbarEnd.className = "toolbar-end";
-  toolbarEnd.append(modeSwitch, storeMaterial);
+  toolbarEnd.append(stop, modeSwitch, storeMaterial);
   toolbar.append(toolbarStart, toolbarEnd);
 
   const boardTabs = document.createElement("div");
@@ -75,21 +93,25 @@ export function renderShell(root: HTMLElement): Shell {
   boardTabs.setAttribute("role", "tablist");
   boardTabs.setAttribute("aria-label", "Whiteboard sources");
 
+  const error = document.createElement("p");
+  error.className = "board-error";
+  error.setAttribute("role", "status");
+  error.hidden = true;
+
+  const boardArea = document.createElement("div");
+  boardArea.className = "board-area";
   const board = document.createElement("article");
   board.className = "board";
   board.setAttribute("aria-label", "Whiteboard");
+  boardArea.append(board);
 
   const sources = document.createElement("section");
   sources.className = "board-sources";
   sources.setAttribute("role", "tabpanel");
   sources.hidden = true;
 
-  const dialogue = document.createElement("section");
-  dialogue.className = "dialogue";
-  dialogue.setAttribute("aria-label", "Dialogue");
-
-  stage.append(toolbar, boardTabs, board, sources);
-  app.append(topics, stage, dialogue);
+  stage.append(toolbar, boardTabs, error, boardArea, sources);
+  app.append(topics, stage);
   root.append(app);
 
   topicsToggle.addEventListener("click", () => {
@@ -97,7 +119,22 @@ export function renderShell(root: HTMLElement): Shell {
     topicsToggle.setAttribute("aria-expanded", open ? "true" : "false");
   });
 
-  return { app, topics, topicsToggle, systemButton, storeMaterial, modeButtons, boardTabs, board, sources, dialogue };
+  return {
+    app,
+    topics,
+    topicsToggle,
+    systemButton,
+    storeMaterial,
+    modeButtons,
+    stop,
+    modelName,
+    modelStatus,
+    error,
+    boardTabs,
+    boardArea,
+    board,
+    sources,
+  };
 }
 
 export function applyMode(shell: Shell, mode: UiMode): void {
