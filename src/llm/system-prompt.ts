@@ -1,12 +1,15 @@
 import { outline, parseLesson, type Section } from "../document/markdown.ts";
-import type { DialogueMessage, PromptMessage } from "../types.ts";
+import { BOARD_COMPONENTS, type BoardSources, type DialogueMessage, type PromptMessage } from "../types.ts";
+import { boardIsEmpty } from "../ui/whiteboard.ts";
 
 export const FIXED_INSTRUCTIONS = `You teach with two surfaces.
-The whiteboard is the lesson. Change it only by calling whiteboard tools.
-The chat is for the learner. Keep chat replies short. Do not paste the lesson into the chat.
-If the whiteboard is empty, write the lesson with whiteboard_replace_document, then tell the learner what you added.
-If the learner asks to change the lesson, edit the section with whiteboard_replace_section or whiteboard_insert_section.
-If the learner asks a question, answer in chat. Update the whiteboard only when the answer should become part of the lesson.`;
+The whiteboard is a page of html, css, js, svg, and json. Change it only by calling whiteboard tools.
+The SVG is inserted in #lesson-svg. To draw, call whiteboard_set with component "svg" and source set to one raw <svg> element with width and height in pixels. Do not call whiteboard_replace_document. Do not wrap the SVG in a sentence or backticks. Draw with basic shapes (rect, circle, line, polygon, text), not long path data. Do not paste that same diagram into html.
+Parsed JSON is lessonData inside the page, or null when json is empty. Put labels, steps, and numbers there when the script should stay stable.
+The chat is for the learner. Keep chat replies short. Do not paste the page source into the chat.
+If the whiteboard is empty, write the page with whiteboard_set.
+Before editing a component, call whiteboard_view. Call whiteboard_snapshot to read what the page currently says.
+A stored markdown document exists only after the learner stores the learning material. It is not the live page. Call whiteboard_store_material only when the learner asks to store it.`;
 
 export const EMPTY_BOARD_LINE = "The whiteboard is empty.";
 export const WHITEBOARD_PLACEHOLDER = "The lesson will appear here.";
@@ -18,7 +21,8 @@ export function estimateTokens(text: string): number {
 }
 
 export interface BuildPromptOptions {
-  markdown: string;
+  sources: BoardSources;
+  materialMarkdown: string;
   messages: DialogueMessage[];
   contextTokens?: number;
   reservedTokens?: number;
@@ -30,8 +34,15 @@ export interface BuiltPrompt {
   history: PromptMessage[];
 }
 
-function learningMaterialHeader(): string {
-  return `${FIXED_INSTRUCTIONS}\n\n# Learning material\n`;
+export function boardStatus(sources: BoardSources): string {
+  if (boardIsEmpty(sources)) return EMPTY_BOARD_LINE;
+  return BOARD_COMPONENTS.map((key) => `${key}: ${sources[key].length} characters`).join(", ") + ".";
+}
+
+export function whiteboardPreface(status: string, includeMaterial: boolean): string {
+  let text = `${FIXED_INSTRUCTIONS}\n\n# Whiteboard\n${status}\n`;
+  if (includeMaterial) text += `\n# Stored learning material\n`;
+  return text;
 }
 
 function renderPartial(title: string, sections: Section[], fullCount: number): string {
@@ -50,7 +61,7 @@ function renderPartial(title: string, sections: Section[], fullCount: number): s
   if (omitted.length > 0) {
     lines.push("");
     lines.push(
-      `Omitted section ids: ${omitted.map((section) => section.id).join(", ")}. Call whiteboard_read for one of them.`,
+      `Omitted section ids: ${omitted.map((section) => section.id).join(", ")}. The stored learning material was shortened to fit the context window.`,
     );
   }
   return lines.join("\n");
@@ -77,7 +88,7 @@ export function fitLesson(markdown: string, tokenBudget: number, maxFullSections
     "Sections:",
     ...listed.map((section) => `- ${section.id}: ${section.heading}`),
     "",
-    `Omitted section ids: ${lesson.sections.map((section) => section.id).join(", ")}. Call whiteboard_read for one of them.`,
+    `Omitted section ids: ${lesson.sections.map((section) => section.id).join(", ")}. The stored learning material was shortened to fit the context window.`,
   ].join("\n");
   return compact;
 }
@@ -86,9 +97,10 @@ export function buildPrompt(options: BuildPromptOptions): BuiltPrompt {
   const contextTokens = options.contextTokens ?? 8192;
   const reservedTokens = options.reservedTokens ?? 1500;
   const budget = Math.max(256, contextTokens - reservedTokens);
-  const header = learningMaterialHeader();
+  const materialMarkdown = options.materialMarkdown.trim();
+  const header = whiteboardPreface(boardStatus(options.sources), materialMarkdown.length > 0);
   const lessonBudget = Math.max(64, budget - estimateTokens(header));
-  const material = fitLesson(options.markdown, lessonBudget, options.maxFullSections);
+  const material = materialMarkdown ? fitLesson(options.materialMarkdown, lessonBudget, options.maxFullSections) : "";
   const system = `${header}${material}`;
   if (system.includes(WHITEBOARD_PLACEHOLDER)) {
     throw new Error("The system prompt must not include the whiteboard placeholder.");

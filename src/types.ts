@@ -1,7 +1,24 @@
+export const BOARD_COMPONENTS = ["html", "css", "js", "svg", "json"] as const;
+
+export type BoardComponent = (typeof BOARD_COMPONENTS)[number];
+
+export interface BoardSources {
+  html: string;
+  css: string;
+  js: string;
+  svg: string;
+  json: string;
+}
+
 export interface TopicRecord {
   id: string;
   title: string;
-  documentMarkdown: string;
+  html: string;
+  css: string;
+  js: string;
+  svg: string;
+  json: string;
+  materialMarkdown: string;
   messages: DialogueMessage[];
   createdAt: number;
   updatedAt: number;
@@ -47,6 +64,8 @@ export interface CreateOptions {
   monitor?: (monitor: EventTarget) => void;
   temperature?: number;
   topK?: number;
+  /** An id from `localLLM.models()`. Omitted, the extension uses its default. */
+  model?: string;
 }
 
 export interface LanguageModelSession {
@@ -74,7 +93,37 @@ export interface LocalLlmInfo {
   version?: string;
 }
 
+export interface ModelPrice {
+  input: number;
+  output: number;
+  cachedInput?: number;
+  long?: { above: number; input: number; output: number };
+  note?: string;
+  asOf?: string;
+}
+
+/** A model this site can run now, as `localLLM.models()` reports it. */
+export interface ModelInfo {
+  id: string;
+  name: string;
+  backend: string;
+  provider: string;
+  engine?: string;
+  default: boolean;
+  input: string[];
+  output: string[];
+  contextWindow: number;
+  inputQuota: number;
+  maxOutputTokens: number;
+  reasoning?: "hybrid" | "always";
+  tools: "native" | "prompted";
+  price: ModelPrice | null;
+  sizeMB?: number;
+  legacy?: boolean;
+}
+
 export interface LocalLlmNamespace {
   info(): Promise<LocalLlmInfo>;
+  models?: () => Promise<ModelInfo[]>;
   version?: string;
 }

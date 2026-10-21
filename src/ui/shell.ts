@@ -2,6 +2,8 @@ export interface Shell {
   app: HTMLElement;
   topics: HTMLElement;
   topicsToggle: HTMLButtonElement;
+  systemButton: HTMLButtonElement;
+  storeMaterial: HTMLButtonElement;
   board: HTMLElement;
   dialogue: HTMLElement;
 }
@@ -20,12 +22,24 @@ export function renderShell(root: HTMLElement): Shell {
 
   const toolbar = document.createElement("div");
   toolbar.className = "board-toolbar";
+  const toolbarStart = document.createElement("div");
+  toolbarStart.className = "toolbar-start";
   const topicsToggle = document.createElement("button");
   topicsToggle.type = "button";
   topicsToggle.className = "topics-toggle";
   topicsToggle.textContent = "Topics";
   topicsToggle.setAttribute("aria-expanded", "false");
-  toolbar.append(topicsToggle);
+  const systemButton = document.createElement("button");
+  systemButton.type = "button";
+  systemButton.className = "system-open";
+  systemButton.textContent = "System";
+  toolbarStart.append(topicsToggle, systemButton);
+  const storeMaterial = document.createElement("button");
+  storeMaterial.type = "button";
+  storeMaterial.className = "store-material";
+  storeMaterial.textContent = "Store learning material";
+  storeMaterial.disabled = true;
+  toolbar.append(toolbarStart, storeMaterial);
 
   const board = document.createElement("article");
   board.className = "board";
@@ -44,7 +58,7 @@ export function renderShell(root: HTMLElement): Shell {
     topicsToggle.setAttribute("aria-expanded", open ? "true" : "false");
   });
 
-  return { app, topics, topicsToggle, board, dialogue };
+  return { app, topics, topicsToggle, systemButton, storeMaterial, board, dialogue };
 }
 
 export function setTopicsOpen(shell: Shell, open: boolean): void {

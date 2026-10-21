@@ -1,11 +1,12 @@
-import { loadBackendStatus, type BackendStatus } from "./llm/backend.ts";
+import { loadBackendStatus, readSavedModelId, writeSavedModelId, type BackendStatus } from "./llm/backend.ts";
 import { Conversation, type StreamState } from "./llm/turn.ts";
 import { createEmptyTopic, createRepository, openDatabase, type TopicRepository } from "./storage/db.ts";
 import type { TopicRecord } from "./types.ts";
 import { renderDialogue, type DialogueView } from "./ui/dialogue.ts";
+import { renderSystemPanel } from "./ui/system.ts";
 import { renderShell, setTopicsOpen, type Shell } from "./ui/shell.ts";
 import { renderTopics } from "./ui/topics.ts";
-import { renderWhiteboard } from "./ui/whiteboard.ts";
+import { boardIsEmpty, renderWhiteboard } from "./ui/whiteboard.ts";
 import "./styles.css";
 
 interface AppController {
@@ -25,6 +26,15 @@ function activeTopic(app: AppController): TopicRecord | undefined {
   return app.topics.find((topic) => topic.id === app.activeId);
 }
 
+export const STORE_MATERIAL_PROMPT =
+  "Store the current whiteboard as the learning material. Write a markdown document of what the page teaches and call whiteboard_store_material. Do not change the html, css, js, svg, or json.";
+
+function syncStoreButton(app: AppController): void {
+  const topic = activeTopic(app);
+  const empty = !topic || boardIsEmpty(topic);
+  app.shell.storeMaterial.disabled = app.busy || empty;
+}
+
 function paint(app: AppController): void {
   const topic = activeTopic(app);
   renderTopics(app.shell.topics, app.topics, app.activeId, {
@@ -32,7 +42,13 @@ function paint(app: AppController): void {
     onSelect: (id) => void selectTopic(app, id),
     onDelete: (id) => void deleteTopic(app, id),
   });
-  renderWhiteboard(app.shell.board, topic?.documentMarkdown ?? "");
+  renderWhiteboard(app.shell.board, {
+    html: topic?.html ?? "",
+    css: topic?.css ?? "",
+    js: topic?.js ?? "",
+    svg: topic?.svg ?? "",
+    json: topic?.json ?? "",
+  });
   app.dialogue.renderTranscript(
     topic?.messages ?? [],
     app.stream && app.stream.topicId === app.activeId ? app.stream.state : null,
@@ -41,6 +57,7 @@ function paint(app: AppController): void {
   app.dialogue.setBusy(app.busy);
   app.dialogue.setComposerEnabled(app.status.composerEnabled);
   app.dialogue.setStatus(app.status.header, app.status.detail);
+  syncStoreButton(app);
 }
 
 function upsert(app: AppController, topic: TopicRecord): void {
@@ -109,9 +126,10 @@ async function deleteTopic(app: AppController, id: string): Promise<void> {
 }
 
 async function refreshStatus(app: AppController): Promise<void> {
-  app.status = await loadBackendStatus(window);
+  app.status = await loadBackendStatus(window, readSavedModelId());
   app.dialogue.setStatus(app.status.header, app.status.detail);
   app.dialogue.setComposerEnabled(app.status.composerEnabled);
+  syncStoreButton(app);
 }
 
 export async function boot(root: HTMLElement): Promise<void> {
@@ -119,6 +137,20 @@ export async function boot(root: HTMLElement): Promise<void> {
   const dialogue = renderDialogue(shell.dialogue, {
     onSend: (text) => void app.conversation.send(app.activeId, text),
     onStop: () => app.conversation.stop(),
+  });
+  shell.storeMaterial.addEventListener("click", () => {
+    void app.conversation.send(app.activeId, STORE_MATERIAL_PROMPT);
+  });
+  const system = renderSystemPanel((id) => {
+    const previous = app.status.chosen?.id ?? null;
+    writeSavedModelId(id);
+    if (id !== previous) app.conversation.destroySession();
+    void refreshStatus(app);
+  });
+  shell.systemButton.addEventListener("click", () => {
+    void refreshStatus(app).then(() => {
+      system.open(app.status.models, app.status.chosen?.id ?? null, app.status.modelNote);
+    });
   });
 
   let app: AppController;
@@ -141,10 +173,13 @@ export async function boot(root: HTMLElement): Promise<void> {
     error: null,
     busy: false,
     status: {
-      header: "Local LLM",
-      detail: "Checking the local model…",
+      header: "Language model",
+      detail: "Checking the model…",
       composerEnabled: false,
       model: null,
+      models: [],
+      modelNote: null,
+      chosen: null,
     },
     conversation: undefined as unknown as Conversation,
   };
@@ -152,6 +187,8 @@ export async function boot(root: HTMLElement): Promise<void> {
   app.conversation = new Conversation({
     repo,
     languageModel: () => app.status.model,
+    modelId: () => app.status.chosen?.id ?? null,
+    contextTokens: () => app.status.chosen?.inputQuota,
     getOpenTopicId: () => app.activeId,
     onTopic: (topic) => {
       upsert(app, topic);
@@ -168,6 +205,7 @@ export async function boot(root: HTMLElement): Promise<void> {
     onBusy: (busy) => {
       app.busy = busy;
       dialogue.setBusy(busy);
+      syncStoreButton(app);
     },
     onDownload: (ratio) => {
       if (ratio === null) return;

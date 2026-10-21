@@ -1,5 +1,4 @@
 import { parseLesson } from "../document/markdown.ts";
-import { replaceDocument } from "../document/ops.ts";
 import type { TopicRepository } from "../storage/db.ts";
 import type {
   CreateOptions,
@@ -9,10 +8,24 @@ import type {
   ToolDeclaration,
   TopicRecord,
 } from "../types.ts";
+import { boardIsEmpty, titleFromHtml } from "../ui/whiteboard.ts";
 import { buildPrompt, estimateTokens } from "./system-prompt.ts";
 import { createWhiteboardTools } from "./tools.ts";
 
 export const FALLBACK_ASSISTANT = "I put the lesson on the whiteboard.";
+
+const SVG_MARKUP = /<svg\b[\s\S]*?<\/svg>/i;
+
+export function extractBoardSvg(reply: string): string | null {
+  const match = SVG_MARKUP.exec(reply);
+  if (!match) return null;
+  const svg = match[0].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\'/g, "'");
+  return /<svg\b/i.test(svg) ? svg : null;
+}
+
+function replyIsToolDump(reply: string): boolean {
+  return /whiteboard_replace_document|```tool_code|whiteboard_set\s*\(/i.test(reply);
+}
 
 export function shouldUseEmptyBoardFallback(input: {
   boardWasEmpty: boolean;
@@ -21,15 +34,16 @@ export function shouldUseEmptyBoardFallback(input: {
   reply: string;
 }): boolean {
   if (!input.boardWasEmpty || input.toolSucceeded || input.aborted) return false;
+  if (replyIsToolDump(input.reply) && extractBoardSvg(input.reply)) return false;
   if (input.reply.length <= 400) return false;
-  return input.reply.split(/\r?\n/).some((line) => /^# /.test(line));
+  return /<[a-z][^>\n]*>/i.test(input.reply);
 }
 
 export function errorNote(error: unknown): string | null {
   const err = error as { name?: string; message?: string };
   switch (err?.name) {
     case "NotAllowedError":
-      return "The site is not allowed to use the model. Enable it in the Local LLM extension and reload.";
+      return "This site is not allowed to use the model. Enable it in the extension and reload.";
     case "QuotaExceededError":
       return "The lesson or the conversation is over the model's limit. Shorten the request.";
     case "InvalidStateError":
@@ -58,7 +72,8 @@ export interface ConversationDeps {
   onError: (message: string | null) => void;
   onBusy: (busy: boolean) => void;
   onDownload: (ratio: number | null) => void;
-  contextTokens?: number;
+  contextTokens?: () => number | undefined;
+  modelId?: () => string | null;
 }
 
 async function* iterateText(source: AsyncIterable<string> | ReadableStream<string>): AsyncGenerator<string> {
@@ -118,7 +133,7 @@ export class Conversation {
     const model = this.deps.languageModel();
     if (!model) {
       this.deps.onError(
-        "The page cannot see the local model. Enable this site in the Local LLM extension and reload.",
+        "The page cannot see a model. Enable this site in the extension and reload.",
       );
       return;
     }
@@ -150,7 +165,8 @@ export class Conversation {
     }
     this.deps.onTopic(topic);
 
-    const boardWasEmpty = topic.documentMarkdown.trim() === "";
+    const boardWasEmpty = boardIsEmpty(topic);
+    const svgAtStart = topic.svg;
     let toolSucceeded = false;
     let toolActive = false;
     const tools = createWhiteboardTools({
@@ -187,6 +203,7 @@ export class Conversation {
       if (abort.signal.aborted) throw Object.assign(new Error("Aborted"), { name: "AbortError" });
 
       let assistant = reply;
+      const dumpedSvg = extractBoardSvg(reply);
       if (
         shouldUseEmptyBoardFallback({
           boardWasEmpty,
@@ -195,11 +212,20 @@ export class Conversation {
           reply,
         })
       ) {
-        const replaced = replaceDocument(reply);
-        await this.persistMarkdown(topicId, replaced.markdown);
+        await this.persistHtml(topicId, reply);
         toolSucceeded = true;
         assistant = FALLBACK_ASSISTANT;
         this.deps.onStream(topicId, { text: assistant, toolActive: false });
+      } else if (dumpedSvg) {
+        const current = await this.deps.repo.get(topicId);
+        if (current && current.svg === svgAtStart) {
+          await this.persistSvg(topicId, dumpedSvg);
+          toolSucceeded = true;
+          if (boardWasEmpty || replyIsToolDump(reply)) {
+            assistant = FALLBACK_ASSISTANT;
+            this.deps.onStream(topicId, { text: assistant, toolActive: false });
+          }
+        }
       }
 
       const fresh = await this.deps.repo.get(topicId);
@@ -234,13 +260,23 @@ export class Conversation {
     this.deps.onBusy(false);
   }
 
-  private async persistMarkdown(topicId: string, markdown: string): Promise<void> {
+  private async persistSvg(topicId: string, svg: string): Promise<void> {
     if (this.deps.getOpenTopicId() !== topicId) throw new Error("This topic is no longer open.");
     const topic = await this.deps.repo.get(topicId);
     if (!topic) throw new Error("This topic is no longer open.");
-    const lesson = parseLesson(markdown);
-    topic.documentMarkdown = markdown;
-    topic.title = lesson.title.trim() || "New topic";
+    topic.svg = svg;
+    topic.updatedAt = Date.now();
+    await this.deps.repo.put(topic);
+    this.deps.onTopic(topic);
+  }
+
+  private async persistHtml(topicId: string, html: string): Promise<void> {
+    if (this.deps.getOpenTopicId() !== topicId) throw new Error("This topic is no longer open.");
+    const topic = await this.deps.repo.get(topicId);
+    if (!topic) throw new Error("This topic is no longer open.");
+    topic.html = html;
+    const title = titleFromHtml(html);
+    if (title) topic.title = title;
     topic.updatedAt = Date.now();
     await this.deps.repo.put(topic);
     this.deps.onTopic(topic);
@@ -264,16 +300,25 @@ export class Conversation {
     for (let attempt = 0; attempt < 5; attempt += 1) {
       if (!alive()) throw Object.assign(new Error("Aborted"), { name: "AbortError" });
       const built = buildPrompt({
-        markdown: topic.documentMarkdown,
+        sources: {
+          html: topic.html,
+          css: topic.css,
+          js: topic.js,
+          svg: topic.svg,
+          json: topic.json,
+        },
+        materialMarkdown: topic.materialMarkdown,
         messages: prior,
-        contextTokens: this.deps.contextTokens,
+        contextTokens: this.deps.contextTokens?.(),
         maxFullSections,
       });
       const initialPrompts = [{ role: "system" as const, content: built.system }, ...built.history];
+      const modelId = this.deps.modelId?.() ?? null;
       created = await model.create({
         initialPrompts,
         tools,
         signal,
+        ...(modelId ? { model: modelId } : {}),
         monitor: (monitor) => {
           monitor.addEventListener("downloadprogress", (event) => {
             const loaded = (event as Event & { loaded?: number }).loaded;
@@ -287,17 +332,22 @@ export class Conversation {
       if (!created.measureInputUsage) return created;
       const assembled = [...initialPrompts.map((message) => message.content), userText].join("\n");
       const measured = await created.measureInputUsage(assembled);
-      const quota = created.inputQuota ?? this.deps.contextTokens ?? 8192;
+      const quota = created.inputQuota ?? this.deps.contextTokens?.() ?? 8192;
       const limit = Math.max(1, quota - 1500);
       if (measured <= limit) return created;
 
       created.destroy();
       this.session = null;
       this.sessionTopicId = null;
-      const lesson = parseLesson(topic.documentMarkdown);
+      const lesson = parseLesson(topic.materialMarkdown);
       const currentCap = maxFullSections ?? lesson.sections.length;
       if (currentCap <= 0 && built.history.length === 0) {
-        const oversized = await model.create({ initialPrompts, tools, signal });
+        const oversized = await model.create({
+          initialPrompts,
+          tools,
+          signal,
+          ...(modelId ? { model: modelId } : {}),
+        });
         this.session = oversized;
         this.sessionTopicId = topic.id;
         return oversized;

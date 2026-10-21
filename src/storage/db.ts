@@ -1,8 +1,22 @@
+import { markdownToStaticHtml } from "../document/static-html.ts";
 import type { TopicRecord } from "../types.ts";
 
 const DB_NAME = "learn-with-llm";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE = "topics";
+
+export function migrateTopicRecord(row: Record<string, unknown>): boolean {
+  if (typeof row.documentMarkdown !== "string") return false;
+  const markdown = row.documentMarkdown;
+  row.materialMarkdown = markdown;
+  row.html = markdownToStaticHtml(markdown);
+  row.css = "";
+  row.js = "";
+  row.svg = "";
+  row.json = "";
+  delete row.documentMarkdown;
+  return true;
+}
 
 export interface TopicRepository {
   list(): Promise<TopicRecord[]>;
@@ -22,12 +36,24 @@ function requestToPromise<T>(request: IDBRequest<T>): Promise<T> {
 export function openDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
-    request.onupgradeneeded = () => {
+    request.onupgradeneeded = (event) => {
       const db = request.result;
       if (!db.objectStoreNames.contains(STORE)) {
         const store = db.createObjectStore(STORE, { keyPath: "id" });
         store.createIndex("byUpdated", "updatedAt");
       }
+      const oldVersion = (event as IDBVersionChangeEvent).oldVersion;
+      if (oldVersion >= 2) return;
+      const tx = request.transaction;
+      if (!tx) return;
+      const cursorRequest = tx.objectStore(STORE).openCursor();
+      cursorRequest.onsuccess = () => {
+        const cursor = cursorRequest.result;
+        if (!cursor) return;
+        const row = cursor.value as Record<string, unknown>;
+        if (migrateTopicRecord(row)) cursor.update(row);
+        cursor.continue();
+      };
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("Could not open IndexedDB."));
@@ -70,7 +96,12 @@ export function createEmptyTopic(now = Date.now()): TopicRecord {
   return {
     id: crypto.randomUUID(),
     title: "New topic",
-    documentMarkdown: "",
+    html: "",
+    css: "",
+    js: "",
+    svg: "",
+    json: "",
+    materialMarkdown: "",
     messages: [],
     createdAt: now,
     updatedAt: now,
