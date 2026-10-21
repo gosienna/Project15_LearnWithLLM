@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createEmptyTopic, type TopicRepository } from "../storage/db.ts";
 import type { CreateOptions, LanguageModelAPI, LanguageModelSession, TopicRecord } from "../types.ts";
-import { extractBoardSvg, FALLBACK_ASSISTANT, shouldUseEmptyBoardFallback, Conversation } from "./turn.ts";
+import { extractBoardSvg, FALLBACK_ASSISTANT, shouldUseEmptyBoardFallback, Conversation, type StreamState } from "./turn.ts";
 
 function memoryRepo(initial: TopicRecord[]): TopicRepository & { all(): TopicRecord[] } {
   const map = new Map(initial.map((topic) => [topic.id, structuredClone(topic)]));
@@ -202,5 +202,193 @@ describe("conversation", () => {
     expect(stored?.svg).toContain('width="100"');
     expect(stored?.html).toBe("");
     expect(stored?.messages.at(-1)?.content).toBe(FALLBACK_ASSISTANT);
+  });
+
+  it("records each round, tool calls, and reasoning in the stored trace", async () => {
+    const topic = createEmptyTopic(4);
+    const repo = memoryRepo([topic]);
+    const model: LanguageModelAPI = {
+      async availability() {
+        return "available";
+      },
+      async create(options) {
+        expect(options?.reasoning).toBe(true);
+        const session: LanguageModelSession = {
+          async *promptStreaming(_input, promptOptions) {
+            promptOptions?.onReasoning?.("Start with a title.");
+            yield "Drawing ";
+            yield "now.";
+            const tool = options?.tools?.find((item) => item.name === "whiteboard_set");
+            await tool?.execute({ component: "html", source: "<h1>Cells</h1>" });
+            yield "Done.";
+          },
+          destroy() {},
+          inputUsage: 300,
+          inputQuota: 8192,
+        };
+        return session;
+      },
+    };
+    const streams: (StreamState | null)[] = [];
+    const conversation = new Conversation({
+      repo,
+      languageModel: () => model,
+      modelId: () => "local:test",
+      getOpenTopicId: () => topic.id,
+      onTopic: () => {},
+      onStream: (_id, state) => streams.push(state && structuredClone(state)),
+      onError: () => {},
+      onBusy: () => {},
+      onDownload: () => {},
+    });
+
+    await conversation.send(topic.id, "Teach me cells");
+    const message = repo.all()[0]?.messages.at(-1);
+    expect(message?.content).toBe("Drawing now.Done.");
+    expect(message?.trace?.modelId).toBe("local:test");
+    expect(message?.trace?.request?.newSession).toBe(true);
+    expect(message?.trace?.request?.initialPrompts?.[0]?.content).toContain("The whiteboard is empty.");
+    expect(message?.trace?.request?.prompt).toBe("Teach me cells");
+    expect(message?.trace?.inputUsage).toBe(300);
+    expect(message?.trace?.events.map((event) => event.kind)).toEqual(["reasoning", "text", "tool", "text"]);
+    const tool = message?.trace?.events[2];
+    expect(tool?.kind === "tool" && tool.output).toEqual({ component: "html", characters: 14, title: "Cells" });
+    expect(streams.some((state) => state?.toolActive && state.events.at(-1)?.kind === "tool")).toBe(true);
+  });
+
+  it("keeps the raw reply in the trace when the fallback replaces it", async () => {
+    const topic = createEmptyTopic(5);
+    const repo = memoryRepo([topic]);
+    const reply = lessonReply();
+    const model: LanguageModelAPI = {
+      async availability() {
+        return "available";
+      },
+      async create() {
+        return {
+          async *promptStreaming() {
+            yield reply;
+          },
+          destroy() {},
+        };
+      },
+    };
+    const conversation = new Conversation({
+      repo,
+      languageModel: () => model,
+      getOpenTopicId: () => topic.id,
+      onTopic: () => {},
+      onStream: () => {},
+      onError: () => {},
+      onBusy: () => {},
+      onDownload: () => {},
+    });
+
+    await conversation.send(topic.id, "Teach me photosynthesis");
+    const message = repo.all()[0]?.messages.at(-1);
+    expect(message?.content).toBe(FALLBACK_ASSISTANT);
+    expect(message?.trace?.rawReply).toBe(reply);
+    expect(message?.trace?.fallback).toBe("html");
+  });
+
+  it("saves a stopped turn as an empty message that stays out of the next prompt", async () => {
+    const topic = createEmptyTopic(6);
+    const repo = memoryRepo([topic]);
+    const creates: CreateOptions[] = [];
+    let conversation: Conversation;
+    const model: LanguageModelAPI = {
+      async availability() {
+        return "available";
+      },
+      async create(options) {
+        creates.push(options ?? {});
+        return {
+          async *promptStreaming(_input, promptOptions) {
+            if (creates.length === 1) {
+              yield "Partial";
+              conversation.stop();
+              if (promptOptions?.signal?.aborted) return;
+            }
+            yield "Fine.";
+          },
+          destroy() {},
+        };
+      },
+    };
+    conversation = new Conversation({
+      repo,
+      languageModel: () => model,
+      getOpenTopicId: () => topic.id,
+      onTopic: () => {},
+      onStream: () => {},
+      onError: () => {},
+      onBusy: () => {},
+      onDownload: () => {},
+    });
+
+    await conversation.send(topic.id, "First");
+    const stopped = repo.all()[0]?.messages.at(-1);
+    expect(stopped?.role).toBe("assistant");
+    expect(stopped?.content).toBe("");
+    expect(stopped?.trace?.error).toBe("Stopped");
+    expect(stopped?.trace?.events).toEqual([{ kind: "text", text: "Partial" }]);
+
+    conversation.destroySession();
+    await conversation.send(topic.id, "Second");
+    const history = creates[1]?.initialPrompts?.slice(1) ?? [];
+    expect(history.map((message) => message.content)).toEqual(["First"]);
+  });
+
+  it("uses a pinned system prompt and sends an edited request once, in a new session", async () => {
+    const topic = { ...createEmptyTopic(7), systemPrompt: "Pinned instructions." };
+    const repo = memoryRepo([topic]);
+    const creates: CreateOptions[] = [];
+    const model: LanguageModelAPI = {
+      async availability() {
+        return "available";
+      },
+      async create(options) {
+        creates.push(options ?? {});
+        return {
+          async *promptStreaming() {
+            yield "Ok.";
+          },
+          destroy() {},
+        };
+      },
+    };
+    const conversation = new Conversation({
+      repo,
+      languageModel: () => model,
+      getOpenTopicId: () => topic.id,
+      onTopic: () => {},
+      onStream: () => {},
+      onError: () => {},
+      onBusy: () => {},
+      onDownload: () => {},
+    });
+
+    expect(conversation.previewSystem(topic)).toEqual({ text: "Pinned instructions.", pinned: true });
+    await conversation.send(topic.id, "One");
+    expect(creates[0]?.initialPrompts?.[0]?.content).toBe("Pinned instructions.");
+
+    const stored = repo.all()[0]!;
+    expect(conversation.previewRequest(stored).newSession).toBe(false);
+    const edited = [
+      { role: "system" as const, content: "Edited system." },
+      { role: "user" as const, content: "Pretend I asked about cells." },
+    ];
+    conversation.setNextRequest(topic.id, edited);
+    expect(conversation.previewRequest(stored)).toEqual({ newSession: true, edited: true, initialPrompts: edited });
+    await conversation.send(topic.id, "Two");
+    expect(creates).toHaveLength(2);
+    expect(creates[1]?.initialPrompts).toEqual(edited);
+    const trace = repo.all()[0]?.messages.at(-1)?.trace;
+    expect(trace?.request).toEqual({ newSession: true, initialPrompts: edited, prompt: "Two", edited: true });
+
+    await conversation.send(topic.id, "Three");
+    expect(creates).toHaveLength(2);
+    expect(repo.all()[0]?.messages.at(-1)?.trace?.request).toEqual({ newSession: false, prompt: "Three" });
+    expect(conversation.previewRequest(repo.all()[0]!).edited).toBe(false);
   });
 });

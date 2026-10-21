@@ -22,6 +22,8 @@ export interface TopicRecord {
   messages: DialogueMessage[];
   createdAt: number;
   updatedAt: number;
+  /** A whole system prompt pinned in Debug mode. Set, it replaces the one built from the board. */
+  systemPrompt?: string;
 }
 
 export interface DialogueMessage {
@@ -29,6 +31,39 @@ export interface DialogueMessage {
   role: "user" | "assistant";
   content: string;
   createdAt: number;
+  /** What happened during an assistant turn, for Debug mode. Absent on older records. */
+  trace?: TurnTrace;
+}
+
+/** One step of an assistant turn, in the order it happened. */
+export type TraceEvent =
+  | { kind: "text"; text: string }
+  | { kind: "reasoning"; text: string }
+  | { kind: "tool"; name: string; input: unknown; output?: unknown; error?: string; ms?: number };
+
+/** The raw input of one request. A reused session receives only the prompt. */
+export interface RequestInput {
+  newSession: boolean;
+  /** The messages a new session was created with: system first, then history. */
+  initialPrompts?: PromptMessage[];
+  prompt: string;
+  /** The initial prompts came from the Debug editor instead of the topic. */
+  edited?: boolean;
+}
+
+export interface TurnTrace {
+  modelId: string | null;
+  startedAt: number;
+  endedAt?: number;
+  events: TraceEvent[];
+  /** The streamed reply, kept only when the fallback replaced it in the chat. */
+  rawReply?: string;
+  fallback?: "html" | "svg";
+  /** What this turn sent to the model. */
+  request?: RequestInput;
+  inputUsage?: number;
+  inputQuota?: number;
+  error?: string;
 }
 
 export interface PromptMessage {
@@ -66,12 +101,14 @@ export interface CreateOptions {
   topK?: number;
   /** An id from `localLLM.models()`. Omitted, the extension uses its default. */
   model?: string;
+  /** Extension only: deliver a reasoning model's thinking to `onReasoning`. */
+  reasoning?: boolean;
 }
 
 export interface LanguageModelSession {
   promptStreaming(
     input: string,
-    options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal; onReasoning?: (text: string) => void },
   ): AsyncIterable<string> | ReadableStream<string>;
   destroy(): void;
   measureInputUsage?: (input: string) => Promise<number>;

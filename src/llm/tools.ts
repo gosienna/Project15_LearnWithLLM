@@ -10,8 +10,8 @@ export interface ToolHost {
   getOpenTopicId: () => string | null;
   repo: TopicRepository;
   onDocument: (topic: TopicRecord) => void;
-  onToolStart?: () => void;
-  onToolEnd?: () => void;
+  onToolStart?: (name: string, input: unknown) => void;
+  onToolEnd?: (name: string, outcome: { output: unknown } | { error: string }) => void;
 }
 
 const COMPONENT_LIST = BOARD_COMPONENTS.join(", ");
@@ -70,60 +70,101 @@ async function saveTopic(host: ToolHost, topic: TopicRecord): Promise<void> {
   host.onDocument(topic);
 }
 
-function wrap(host: ToolHost, run: (input: unknown) => Promise<unknown>): ToolDeclaration["execute"] {
+function wrap(host: ToolHost, name: string, run: (input: unknown) => Promise<unknown>): ToolDeclaration["execute"] {
   return async (input: unknown) => {
-    host.onToolStart?.();
+    host.onToolStart?.(name, input);
     try {
-      return await run(input);
-    } finally {
-      host.onToolEnd?.();
+      const output = await run(input);
+      host.onToolEnd?.(name, { output });
+      return output;
+    } catch (error) {
+      host.onToolEnd?.(name, { error: error instanceof Error ? error.message : String(error) });
+      throw error;
     }
   };
 }
 
-export const WHITEBOARD_TOOL_INFO: { name: string; description: string }[] = [
+/** Name, description, and schema sent with the session. Handlers stay in the app. */
+export interface ModelToolInput {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
+export const WHITEBOARD_TOOL_SPECS: ModelToolInput[] = [
   {
     name: "whiteboard_view",
     description:
       "Read one whiteboard source before editing it. Pass component html, css, js, svg, or json. Pass all only when you need every source and they are short.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        component: {
+          type: "string",
+          description: `One of ${COMPONENT_LIST}, or all.`,
+        },
+      },
+      required: ["component"],
+    },
   },
   {
     name: "whiteboard_set",
     description:
       "Replace one whiteboard source: html, css, js, svg, or json. Use this to create the page and to change one component. For svg, source is one raw <svg> element with width and height in pixels, not a sentence. json must be a JSON string, or empty when there is no data.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        component: {
+          type: "string",
+          description: `One of ${COMPONENT_LIST}.`,
+        },
+        source: {
+          type: "string",
+          description: "The full replacement for that component.",
+        },
+      },
+      required: ["component", "source"],
+    },
   },
   {
     name: "whiteboard_snapshot",
     description:
       "Read the visible text of the current page, including the SVG labels. Call this to see what the learner sees. This does not save anything.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
   },
   {
     name: "whiteboard_store_material",
     description:
       "Save a markdown document of what the page teaches. Call this only when the learner asks to store the learning material. Do not change html, css, js, svg, or json.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        markdown: {
+          type: "string",
+          description: "The learning material as markdown.",
+        },
+      },
+      required: ["markdown"],
+    },
   },
 ];
 
-function toolDescription(name: string): string {
-  return WHITEBOARD_TOOL_INFO.find((tool) => tool.name === name)?.description ?? "";
+export const WHITEBOARD_TOOL_INFO = WHITEBOARD_TOOL_SPECS.map(({ name, description }) => ({ name, description }));
+
+function spec(name: string): ModelToolInput {
+  const found = WHITEBOARD_TOOL_SPECS.find((tool) => tool.name === name);
+  if (!found) throw new Error(`Missing whiteboard tool ${name}.`);
+  return found;
 }
 
 export function createWhiteboardTools(host: ToolHost): ToolDeclaration[] {
   return [
     {
-      name: "whiteboard_view",
-      description: toolDescription("whiteboard_view"),
-      inputSchema: {
-        type: "object",
-        properties: {
-          component: {
-            type: "string",
-            description: `One of ${COMPONENT_LIST}, or all.`,
-          },
-        },
-        required: ["component"],
-      },
-      execute: wrap(host, async (input) => {
+      ...spec("whiteboard_view"),
+      execute: wrap(host, "whiteboard_view", async (input) => {
         const args = asObject(input);
         if (typeof args.component !== "string") throw new Error("component must be a string.");
         const topic = await loadTopic(host);
@@ -145,23 +186,8 @@ export function createWhiteboardTools(host: ToolHost): ToolDeclaration[] {
       }),
     },
     {
-      name: "whiteboard_set",
-      description: toolDescription("whiteboard_set"),
-      inputSchema: {
-        type: "object",
-        properties: {
-          component: {
-            type: "string",
-            description: `One of ${COMPONENT_LIST}.`,
-          },
-          source: {
-            type: "string",
-            description: "The full replacement for that component.",
-          },
-        },
-        required: ["component", "source"],
-      },
-      execute: wrap(host, async (input) => {
+      ...spec("whiteboard_set"),
+      execute: wrap(host, "whiteboard_set", async (input) => {
         const args = asObject(input);
         if (typeof args.component !== "string" || !isComponent(args.component)) {
           throw new Error(`component must be ${COMPONENT_LIST}.`);
@@ -193,32 +219,16 @@ export function createWhiteboardTools(host: ToolHost): ToolDeclaration[] {
       }),
     },
     {
-      name: "whiteboard_snapshot",
-      description: toolDescription("whiteboard_snapshot"),
-      inputSchema: {
-        type: "object",
-        properties: {},
-      },
-      execute: wrap(host, async (input) => {
+      ...spec("whiteboard_snapshot"),
+      execute: wrap(host, "whiteboard_snapshot", async (input) => {
         if (input !== undefined && input !== null) asObject(input);
         const topic = await loadTopic(host);
         return snapshotBoard(sourcesOf(topic));
       }),
     },
     {
-      name: "whiteboard_store_material",
-      description: toolDescription("whiteboard_store_material"),
-      inputSchema: {
-        type: "object",
-        properties: {
-          markdown: {
-            type: "string",
-            description: "The learning material as markdown.",
-          },
-        },
-        required: ["markdown"],
-      },
-      execute: wrap(host, async (input) => {
+      ...spec("whiteboard_store_material"),
+      execute: wrap(host, "whiteboard_store_material", async (input) => {
         const args = asObject(input);
         if (typeof args.markdown !== "string") throw new Error("markdown must be a string.");
         if (args.markdown.trim() === "") throw new Error("markdown is empty.");

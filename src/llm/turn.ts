@@ -5,12 +5,15 @@ import type {
   DialogueMessage,
   LanguageModelAPI,
   LanguageModelSession,
+  PromptMessage,
   ToolDeclaration,
   TopicRecord,
+  TraceEvent,
 } from "../types.ts";
 import { boardIsEmpty, titleFromHtml } from "../ui/whiteboard.ts";
 import { buildPrompt, estimateTokens } from "./system-prompt.ts";
 import { createWhiteboardTools } from "./tools.ts";
+import { capText, TraceRecorder } from "./trace.ts";
 
 export const FALLBACK_ASSISTANT = "I put the lesson on the whiteboard.";
 
@@ -61,6 +64,8 @@ export function errorNote(error: unknown): string | null {
 export interface StreamState {
   text: string | null;
   toolActive: boolean;
+  /** The turn so far, for Debug mode. */
+  events: TraceEvent[];
 }
 
 export interface ConversationDeps {
@@ -99,6 +104,11 @@ export class Conversation {
   private abort: AbortController | null = null;
   private epoch = 0;
   private busy = false;
+  /** The initial prompts of a session created during the current turn, for its trace. */
+  private createdPrompts: PromptMessage[] | null = null;
+  /** Initial prompts edited in Debug mode, used once by the topic's next send. */
+  private readonly nextPrompts = new Map<string, PromptMessage[]>();
+  private resetAfterTurn = false;
 
   constructor(private readonly deps: ConversationDeps) {}
 
@@ -112,6 +122,48 @@ export class Conversation {
     this.sessionTopicId = null;
   }
 
+  /** Use these initial prompts, in a new session, for the topic's next send. Null discards them. */
+  setNextRequest(topicId: string, prompts: PromptMessage[] | null): void {
+    if (prompts) this.nextPrompts.set(topicId, prompts.map((message) => ({ ...message })));
+    else this.nextPrompts.delete(topicId);
+  }
+
+  /** Start a new session on the next send, without cutting off a turn that is running. */
+  resetSession(): void {
+    if (this.busy) this.resetAfterTurn = true;
+    else this.destroySession();
+  }
+
+  /** The system prompt the topic's next new session gets: the pinned one or the automatic one. */
+  previewSystem(topic: TopicRecord): { text: string; pinned: boolean } {
+    if (topic.systemPrompt !== undefined) return { text: topic.systemPrompt, pinned: true };
+    const built = buildPrompt({
+      sources: { html: topic.html, css: topic.css, js: topic.js, svg: topic.svg, json: topic.json },
+      materialMarkdown: topic.materialMarkdown,
+      messages: [],
+      contextTokens: this.deps.contextTokens?.(),
+    });
+    return { text: built.system, pinned: false };
+  }
+
+  /** What the next send on this topic will use, if the learner sends now. */
+  previewRequest(topic: TopicRecord): { newSession: boolean; edited: boolean; initialPrompts: PromptMessage[] } {
+    const edited = this.nextPrompts.get(topic.id);
+    if (edited) return { newSession: true, edited: true, initialPrompts: edited.map((message) => ({ ...message })) };
+    const built = buildPrompt({
+      sources: { html: topic.html, css: topic.css, js: topic.js, svg: topic.svg, json: topic.json },
+      materialMarkdown: topic.materialMarkdown,
+      messages: topic.messages,
+      contextTokens: this.deps.contextTokens?.(),
+      systemOverride: topic.systemPrompt,
+    });
+    return {
+      newSession: !(this.session && this.sessionTopicId === topic.id),
+      edited: false,
+      initialPrompts: [{ role: "system", content: built.system }, ...built.history],
+    };
+  }
+
   stop(): void {
     this.abort?.abort();
   }
@@ -120,6 +172,7 @@ export class Conversation {
     this.epoch += 1;
     this.stop();
     this.destroySession();
+    this.resetAfterTurn = false;
     this.busy = false;
     this.abort = null;
     this.deps.onBusy(false);
@@ -169,6 +222,10 @@ export class Conversation {
     const svgAtStart = topic.svg;
     let toolSucceeded = false;
     let toolActive = false;
+    const recorder = new TraceRecorder(this.deps.modelId?.() ?? null);
+    const stream = (text: string | null, active: boolean) => {
+      if (alive()) this.deps.onStream(topicId, { text, toolActive: active, events: recorder.events });
+    };
     const tools = createWhiteboardTools({
       topicId,
       getOpenTopicId: this.deps.getOpenTopicId,
@@ -177,27 +234,46 @@ export class Conversation {
         toolSucceeded = true;
         if (alive()) this.deps.onTopic(saved);
       },
-      onToolStart: () => {
+      onToolStart: (name, input) => {
         toolActive = true;
-        if (!alive()) return;
-        this.deps.onStream(topicId, { text: reply ? reply : null, toolActive: true });
+        recorder.toolStart(name, input);
+        stream(reply ? reply : null, true);
       },
-      onToolEnd: () => {
+      onToolEnd: (name, outcome) => {
         toolActive = false;
-        if (!alive()) return;
-        this.deps.onStream(topicId, { text: reply, toolActive: false });
+        recorder.toolEnd(name, outcome);
+        stream(reply, false);
       },
     });
 
     let reply = "";
+    let session: LanguageModelSession | null = null;
     try {
-      const session = await this.ensureSession(model, topic, trimmed, tools, abort.signal, alive);
+      this.createdPrompts = null;
+      const edited = this.nextPrompts.get(topicId);
+      this.nextPrompts.delete(topicId);
+      session = edited
+        ? await this.createEdited(model, topic.id, edited, tools, abort.signal)
+        : await this.ensureSession(model, topic, trimmed, tools, abort.signal, alive);
       if (!alive()) return;
-      this.deps.onStream(topicId, { text: "", toolActive });
-      for await (const chunk of iterateText(session.promptStreaming(trimmed, { signal: abort.signal }))) {
+      const sent = this.createdPrompts as PromptMessage[] | null;
+      recorder.trace.request = {
+        newSession: sent !== null,
+        ...(sent ? { initialPrompts: sent.map((message) => ({ ...message, content: capText(message.content) })) } : {}),
+        prompt: trimmed,
+        ...(edited ? { edited: true } : {}),
+      };
+      stream("", toolActive);
+      const onReasoning = (text: string) => {
+        if (!alive() || abort.signal.aborted) return;
+        recorder.addReasoning(text);
+        stream(reply, toolActive);
+      };
+      for await (const chunk of iterateText(session.promptStreaming(trimmed, { signal: abort.signal, onReasoning }))) {
         if (!alive() || abort.signal.aborted) break;
         reply += chunk;
-        this.deps.onStream(topicId, { text: reply, toolActive: false });
+        recorder.addText(chunk);
+        stream(reply, false);
       }
       if (!alive()) return;
       if (abort.signal.aborted) throw Object.assign(new Error("Aborted"), { name: "AbortError" });
@@ -215,39 +291,38 @@ export class Conversation {
         await this.persistHtml(topicId, reply);
         toolSucceeded = true;
         assistant = FALLBACK_ASSISTANT;
-        this.deps.onStream(topicId, { text: assistant, toolActive: false });
+        recorder.trace.rawReply = reply;
+        recorder.trace.fallback = "html";
+        stream(assistant, false);
       } else if (dumpedSvg) {
         const current = await this.deps.repo.get(topicId);
         if (current && current.svg === svgAtStart) {
           await this.persistSvg(topicId, dumpedSvg);
           toolSucceeded = true;
+          recorder.trace.fallback = "svg";
           if (boardWasEmpty || replyIsToolDump(reply)) {
             assistant = FALLBACK_ASSISTANT;
-            this.deps.onStream(topicId, { text: assistant, toolActive: false });
+            recorder.trace.rawReply = reply;
+            stream(assistant, false);
           }
         }
       }
 
-      const fresh = await this.deps.repo.get(topicId);
-      if (fresh && alive()) {
-        fresh.messages.push({
-          id: crypto.randomUUID(),
-          role: "assistant",
-          content: assistant,
-          createdAt: Date.now(),
-        });
-        fresh.updatedAt = Date.now();
-        await this.deps.repo.put(fresh);
-        this.deps.onTopic(fresh);
-        this.deps.onStream(topicId, null);
-      }
+      this.measure(recorder, session);
+      await this.persistAssistant(topicId, assistant, recorder, alive);
+      if (alive()) this.deps.onStream(topicId, null);
       if (toolSucceeded) this.destroySession();
     } catch (error) {
       if (!alive()) return;
       this.deps.onStream(topicId, null);
       const note = errorNote(error);
       if (note) this.deps.onError(note);
-      if ((error as { name?: string }).name === "InvalidStateError") this.destroySession();
+      // Keep the failed turn's trace; an empty message is hidden in the chat and the prompt.
+      const err = error as { name?: string; message?: string };
+      recorder.trace.error = err?.name === "AbortError" ? "Stopped" : note ?? err?.message ?? "The request failed.";
+      this.measure(recorder, session);
+      await this.persistAssistant(topicId, "", recorder, alive).catch(() => {});
+      if (err?.name === "InvalidStateError") this.destroySession();
     } finally {
       this.finish(alive);
     }
@@ -255,9 +330,38 @@ export class Conversation {
 
   private finish(alive: () => boolean): void {
     if (!alive()) return;
+    if (this.resetAfterTurn) {
+      this.resetAfterTurn = false;
+      this.destroySession();
+    }
     this.busy = false;
     this.abort = null;
     this.deps.onBusy(false);
+  }
+
+  private measure(recorder: TraceRecorder, session: LanguageModelSession | null): void {
+    if (typeof session?.inputUsage === "number") recorder.trace.inputUsage = session.inputUsage;
+    if (typeof session?.inputQuota === "number") recorder.trace.inputQuota = session.inputQuota;
+  }
+
+  private async persistAssistant(
+    topicId: string,
+    content: string,
+    recorder: TraceRecorder,
+    alive: () => boolean,
+  ): Promise<void> {
+    const fresh = await this.deps.repo.get(topicId);
+    if (!fresh || !alive()) return;
+    fresh.messages.push({
+      id: crypto.randomUUID(),
+      role: "assistant",
+      content,
+      createdAt: Date.now(),
+      trace: recorder.finish(),
+    });
+    fresh.updatedAt = Date.now();
+    await this.deps.repo.put(fresh);
+    this.deps.onTopic(fresh);
   }
 
   private async persistSvg(topicId: string, svg: string): Promise<void> {
@@ -280,6 +384,29 @@ export class Conversation {
     topic.updatedAt = Date.now();
     await this.deps.repo.put(topic);
     this.deps.onTopic(topic);
+  }
+
+  /** A new session from initial prompts edited in Debug mode, sent as they are. */
+  private async createEdited(
+    model: LanguageModelAPI,
+    topicId: string,
+    initialPrompts: PromptMessage[],
+    tools: ToolDeclaration[],
+    signal: AbortSignal,
+  ): Promise<LanguageModelSession> {
+    this.destroySession();
+    const modelId = this.deps.modelId?.() ?? null;
+    const created = await model.create({
+      initialPrompts,
+      tools,
+      signal,
+      reasoning: true,
+      ...(modelId ? { model: modelId } : {}),
+    });
+    this.session = created;
+    this.sessionTopicId = topicId;
+    this.createdPrompts = initialPrompts;
+    return created;
   }
 
   private async ensureSession(
@@ -311,6 +438,7 @@ export class Conversation {
         messages: prior,
         contextTokens: this.deps.contextTokens?.(),
         maxFullSections,
+        systemOverride: topic.systemPrompt,
       });
       const initialPrompts = [{ role: "system" as const, content: built.system }, ...built.history];
       const modelId = this.deps.modelId?.() ?? null;
@@ -318,6 +446,7 @@ export class Conversation {
         initialPrompts,
         tools,
         signal,
+        reasoning: true,
         ...(modelId ? { model: modelId } : {}),
         monitor: (monitor) => {
           monitor.addEventListener("downloadprogress", (event) => {
@@ -328,6 +457,7 @@ export class Conversation {
       });
       this.session = created;
       this.sessionTopicId = topic.id;
+      this.createdPrompts = initialPrompts;
 
       if (!created.measureInputUsage) return created;
       const assembled = [...initialPrompts.map((message) => message.content), userText].join("\n");
@@ -346,6 +476,7 @@ export class Conversation {
           initialPrompts,
           tools,
           signal,
+          reasoning: true,
           ...(modelId ? { model: modelId } : {}),
         });
         this.session = oversized;

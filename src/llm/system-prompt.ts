@@ -27,6 +27,8 @@ export interface BuildPromptOptions {
   contextTokens?: number;
   reservedTokens?: number;
   maxFullSections?: number;
+  /** A system prompt pinned to the topic; replaces the instructions, board status, and material. */
+  systemOverride?: string;
 }
 
 export interface BuiltPrompt {
@@ -93,10 +95,7 @@ export function fitLesson(markdown: string, tokenBudget: number, maxFullSections
   return compact;
 }
 
-export function buildPrompt(options: BuildPromptOptions): BuiltPrompt {
-  const contextTokens = options.contextTokens ?? 8192;
-  const reservedTokens = options.reservedTokens ?? 1500;
-  const budget = Math.max(256, contextTokens - reservedTokens);
+function automaticSystem(options: BuildPromptOptions, budget: number): string {
   const materialMarkdown = options.materialMarkdown.trim();
   const header = whiteboardPreface(boardStatus(options.sources), materialMarkdown.length > 0);
   const lessonBudget = Math.max(64, budget - estimateTokens(header));
@@ -105,10 +104,21 @@ export function buildPrompt(options: BuildPromptOptions): BuiltPrompt {
   if (system.includes(WHITEBOARD_PLACEHOLDER)) {
     throw new Error("The system prompt must not include the whiteboard placeholder.");
   }
+  return system;
+}
+
+export function buildPrompt(options: BuildPromptOptions): BuiltPrompt {
+  const contextTokens = options.contextTokens ?? 8192;
+  const reservedTokens = options.reservedTokens ?? 1500;
+  const budget = Math.max(256, contextTokens - reservedTokens);
+  const system = options.systemOverride ?? automaticSystem(options, budget);
 
   let remaining = budget - estimateTokens(system);
   const history: PromptMessage[] = [];
-  const messages = options.messages.filter((message) => message.role === "user" || message.role === "assistant");
+  // Assistant messages with no text are failed or stopped turns, kept only for their trace.
+  const messages = options.messages.filter(
+    (message) => message.role === "user" || (message.role === "assistant" && message.content.trim() !== ""),
+  );
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i];
     const cost = estimateTokens(message.content) + 1;

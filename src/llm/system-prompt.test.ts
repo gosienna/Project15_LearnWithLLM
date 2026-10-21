@@ -47,4 +47,22 @@ describe("system prompt", () => {
     expect(system).toContain("shortened to fit the context window");
     expect(system).not.toContain(WHITEBOARD_PLACEHOLDER);
   });
+
+  it("uses a pinned system prompt as it is and still builds the history", () => {
+    const { system, history } = buildPrompt({
+      sources: { ...emptyBoard(), html: "<h1>Cells</h1>" },
+      materialMarkdown: "",
+      messages: [
+        { id: "1", role: "user", content: "Hi", createdAt: 1 },
+        { id: "2", role: "assistant", content: "", createdAt: 2 },
+        { id: "3", role: "assistant", content: "Hello", createdAt: 3 },
+      ],
+      systemOverride: "You are a pirate tutor.",
+    });
+    expect(system).toBe("You are a pirate tutor.");
+    expect(history).toEqual([
+      { role: "user", content: "Hi" },
+      { role: "assistant", content: "Hello" },
+    ]);
+  });
 });

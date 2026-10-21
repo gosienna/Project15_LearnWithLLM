@@ -4,7 +4,9 @@ import { createEmptyTopic, createRepository, openDatabase, type TopicRepository 
 import type { TopicRecord } from "./types.ts";
 import { renderDialogue, type DialogueView } from "./ui/dialogue.ts";
 import { renderSystemPanel } from "./ui/system.ts";
-import { renderShell, setTopicsOpen, type Shell } from "./ui/shell.ts";
+import { readMode, writeMode, type UiMode } from "./ui/mode.ts";
+import { applyMode, renderShell, setTopicsOpen, type Shell } from "./ui/shell.ts";
+import { renderSources, type PromptInputs } from "./ui/sources.ts";
 import { renderTopics } from "./ui/topics.ts";
 import { boardIsEmpty, renderWhiteboard } from "./ui/whiteboard.ts";
 import "./styles.css";
@@ -20,6 +22,7 @@ interface AppController {
   busy: boolean;
   status: BackendStatus;
   conversation: Conversation;
+  mode: UiMode;
 }
 
 function activeTopic(app: AppController): TopicRecord | undefined {
@@ -42,22 +45,66 @@ function paint(app: AppController): void {
     onSelect: (id) => void selectTopic(app, id),
     onDelete: (id) => void deleteTopic(app, id),
   });
-  renderWhiteboard(app.shell.board, {
+  const sources = {
     html: topic?.html ?? "",
     css: topic?.css ?? "",
     js: topic?.js ?? "",
     svg: topic?.svg ?? "",
     json: topic?.json ?? "",
-  });
+  };
+  renderWhiteboard(app.shell.board, sources);
+  renderSources(
+    { tabs: app.shell.boardTabs, board: app.shell.board, pane: app.shell.sources },
+    { ...sources, material: topic?.materialMarkdown ?? "" },
+    app.mode,
+    topic ? promptInputs(app, topic) : undefined,
+  );
   app.dialogue.renderTranscript(
     topic?.messages ?? [],
     app.stream && app.stream.topicId === app.activeId ? app.stream.state : null,
+    app.mode,
   );
   app.dialogue.setError(app.error);
   app.dialogue.setBusy(app.busy);
   app.dialogue.setComposerEnabled(app.status.composerEnabled);
   app.dialogue.setStatus(app.status.header, app.status.detail);
   syncStoreButton(app);
+}
+
+function promptInputs(app: AppController, topic: TopicRecord): PromptInputs {
+  return {
+    topicId: topic.id,
+    system: () => app.conversation.previewSystem(topic),
+    request: () => app.conversation.previewRequest(topic),
+    prompt: () => app.dialogue.draft(),
+    subscribePrompt: (listener) => app.dialogue.subscribeDraft(listener),
+    onPinSystem: (text) => void pinSystemPrompt(app, topic.id, text),
+    onUnpinSystem: () => void pinSystemPrompt(app, topic.id, undefined),
+    onSetRequest: (prompts) => {
+      app.conversation.setNextRequest(topic.id, prompts);
+      paint(app);
+    },
+  };
+}
+
+async function pinSystemPrompt(app: AppController, topicId: string, text: string | undefined): Promise<void> {
+  const topic = await app.repo.get(topicId);
+  if (!topic) return;
+  if (text === undefined) delete topic.systemPrompt;
+  else topic.systemPrompt = text;
+  topic.updatedAt = Date.now();
+  await app.repo.put(topic);
+  if (app.activeId === topicId) app.conversation.resetSession();
+  upsert(app, topic);
+  paint(app);
+}
+
+function setMode(app: AppController, mode: UiMode): void {
+  if (mode === app.mode) return;
+  app.mode = mode;
+  writeMode(mode);
+  applyMode(app.shell, mode);
+  paint(app);
 }
 
 function upsert(app: AppController, topic: TopicRecord): void {
@@ -182,7 +229,17 @@ export async function boot(root: HTMLElement): Promise<void> {
       chosen: null,
     },
     conversation: undefined as unknown as Conversation,
+    mode: readMode(),
   };
+  applyMode(shell, app.mode);
+  shell.modeButtons.clean.addEventListener("click", () => setMode(app, "clean"));
+  shell.modeButtons.debug.addEventListener("click", () => setMode(app, "debug"));
+  window.addEventListener("keydown", (event) => {
+    // Ctrl, not Cmd: Cmd+Shift+D is the browser's "bookmark all tabs" on macOS.
+    if (!event.ctrlKey || event.metaKey || !event.shiftKey || event.key.toLowerCase() !== "d") return;
+    event.preventDefault();
+    setMode(app, app.mode === "debug" ? "clean" : "debug");
+  });
 
   app.conversation = new Conversation({
     repo,

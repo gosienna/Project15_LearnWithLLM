@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createEmptyTopic, type TopicRepository } from "../storage/db.ts";
 import type { TopicRecord } from "../types.ts";
-import { createWhiteboardTools, VIEW_ALL_CHAR_LIMIT } from "./tools.ts";
+import { createWhiteboardTools, VIEW_ALL_CHAR_LIMIT, WHITEBOARD_TOOL_SPECS } from "./tools.ts";
 
 function memoryRepo(initial: TopicRecord[]): TopicRepository & { all(): TopicRecord[] } {
   const map = new Map(initial.map((topic) => [topic.id, structuredClone(topic)]));
@@ -40,6 +40,7 @@ describe("whiteboard tools", () => {
     const topic = createEmptyTopic(1);
     const repo = memoryRepo([topic]);
     const tools = createWhiteboardTools(hostFor(topic, repo, () => topic.id));
+    expect(tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }))).toEqual(WHITEBOARD_TOOL_SPECS);
     const set = tools.find((tool) => tool.name === "whiteboard_set");
     const view = tools.find((tool) => tool.name === "whiteboard_view");
     const snapshot = tools.find((tool) => tool.name === "whiteboard_snapshot");
@@ -103,5 +104,25 @@ describe("whiteboard tools", () => {
     if (!set) throw new Error("missing set tool");
     await expect(set.execute({ component: "css", source: "p{color:red}" })).rejects.toThrow(/no longer open/);
     expect(repo.all()[0]?.css).toBe("");
+  });
+
+  it("reports each call's name, input, and outcome to the host", async () => {
+    const topic = createEmptyTopic(9);
+    const repo = memoryRepo([topic]);
+    const calls: unknown[] = [];
+    const tools = createWhiteboardTools({
+      ...hostFor(topic, repo, () => topic.id),
+      onToolStart: (name, input) => calls.push(["start", name, input]),
+      onToolEnd: (name, outcome) => calls.push(["end", name, outcome]),
+    });
+    const set = tools.find((tool) => tool.name === "whiteboard_set")!;
+    await set.execute({ component: "css", source: "h1 {}" });
+    await expect(set.execute({ component: "json", source: "{" })).rejects.toThrow();
+    expect(calls).toEqual([
+      ["start", "whiteboard_set", { component: "css", source: "h1 {}" }],
+      ["end", "whiteboard_set", { output: { component: "css", characters: 5 } }],
+      ["start", "whiteboard_set", { component: "json", source: "{" }],
+      ["end", "whiteboard_set", { error: "json must be empty or a JSON string." }],
+    ]);
   });
 });

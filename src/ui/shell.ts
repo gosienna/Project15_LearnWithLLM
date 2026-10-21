@@ -1,10 +1,15 @@
+import type { UiMode } from "./mode.ts";
+
 export interface Shell {
   app: HTMLElement;
   topics: HTMLElement;
   topicsToggle: HTMLButtonElement;
   systemButton: HTMLButtonElement;
   storeMaterial: HTMLButtonElement;
+  modeButtons: Record<UiMode, HTMLButtonElement>;
+  boardTabs: HTMLElement;
   board: HTMLElement;
+  sources: HTMLElement;
   dialogue: HTMLElement;
 }
 
@@ -39,17 +44,51 @@ export function renderShell(root: HTMLElement): Shell {
   storeMaterial.className = "store-material";
   storeMaterial.textContent = "Store learning material";
   storeMaterial.disabled = true;
-  toolbar.append(toolbarStart, storeMaterial);
+
+  const modeSwitch = document.createElement("div");
+  modeSwitch.className = "mode-switch";
+  modeSwitch.setAttribute("role", "group");
+  modeSwitch.setAttribute("aria-label", "View mode");
+  const modeButton = (mode: UiMode, label: string, hint: string) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "mode-option";
+    button.dataset.mode = mode;
+    button.textContent = label;
+    button.title = hint;
+    button.setAttribute("aria-pressed", "false");
+    return button;
+  };
+  const modeButtons: Record<UiMode, HTMLButtonElement> = {
+    clean: modeButton("clean", "Clean", "Only the lesson and the conversation"),
+    debug: modeButton("debug", "Debug", "Every step of each turn and the raw whiteboard (Ctrl+Shift+D)"),
+  };
+  modeSwitch.append(modeButtons.clean, modeButtons.debug);
+
+  const toolbarEnd = document.createElement("div");
+  toolbarEnd.className = "toolbar-end";
+  toolbarEnd.append(modeSwitch, storeMaterial);
+  toolbar.append(toolbarStart, toolbarEnd);
+
+  const boardTabs = document.createElement("div");
+  boardTabs.className = "board-tabs";
+  boardTabs.setAttribute("role", "tablist");
+  boardTabs.setAttribute("aria-label", "Whiteboard sources");
 
   const board = document.createElement("article");
   board.className = "board";
   board.setAttribute("aria-label", "Whiteboard");
 
+  const sources = document.createElement("section");
+  sources.className = "board-sources";
+  sources.setAttribute("role", "tabpanel");
+  sources.hidden = true;
+
   const dialogue = document.createElement("section");
   dialogue.className = "dialogue";
   dialogue.setAttribute("aria-label", "Dialogue");
 
-  stage.append(toolbar, board);
+  stage.append(toolbar, boardTabs, board, sources);
   app.append(topics, stage, dialogue);
   root.append(app);
 
@@ -58,7 +97,14 @@ export function renderShell(root: HTMLElement): Shell {
     topicsToggle.setAttribute("aria-expanded", open ? "true" : "false");
   });
 
-  return { app, topics, topicsToggle, systemButton, storeMaterial, board, dialogue };
+  return { app, topics, topicsToggle, systemButton, storeMaterial, modeButtons, boardTabs, board, sources, dialogue };
+}
+
+export function applyMode(shell: Shell, mode: UiMode): void {
+  shell.app.dataset.mode = mode;
+  for (const [key, button] of Object.entries(shell.modeButtons)) {
+    button.setAttribute("aria-pressed", key === mode ? "true" : "false");
+  }
 }
 
 export function setTopicsOpen(shell: Shell, open: boolean): void {
