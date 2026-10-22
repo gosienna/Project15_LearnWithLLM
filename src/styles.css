@@ -305,6 +305,29 @@ button { cursor: pointer; }
 
 .source-code.is-empty { color: var(--muted); font-style: italic; }
 
+.board-sources:has(.module-card) {
+  overflow: auto;
+  padding: 12px;
+}
+
+.module-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  padding: 12px;
+}
+
+.module-title { margin: 0; font-size: 1rem; }
+.module-usage-label { margin: 4px 0 0; font-size: 0.8rem; font-weight: 600; }
+.module-usage { margin: 0; padding: 8px 12px; border-left: 3px solid var(--line); font-size: 0.85rem; }
+.module-card .source-header { padding: 4px 0; }
+.module-card .source-code { flex: none; max-height: 320px; border: 1px solid var(--line); border-radius: 6px; }
+.module-source > summary { cursor: pointer; }
+.module-source > summary .source-header { display: inline-flex; width: calc(100% - 1.5em); }
+
 .board-sources:has(.editor-text) {
   overflow: auto;
   padding: 12px;

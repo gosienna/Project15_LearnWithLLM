@@ -126,7 +126,7 @@ export const WHITEBOARD_TOOL_SPECS: ModelToolInput[] = [
   {
     name: "whiteboard_set",
     description:
-      "Replace one whiteboard source: html, css, js, svg, or json. Use this to create the page or to rewrite most of one component; to add or change a part, use whiteboard_insert or whiteboard_edit. For svg, source is one raw <svg> element with width and height in pixels, not a sentence. json must be a JSON string, or empty when there is no data.",
+      "Replace one whiteboard source: html, css, js, svg, or json. Use this to create the page or to rewrite most of one component; to add or change a part, use whiteboard_insert or whiteboard_edit. For svg, source is one raw <svg> element with width and height in pixels, not a sentence. json must be a JSON string, or empty when there is no data. LaTeX in \\( \\) or \\[ \\] renders by itself.",
     inputSchema: {
       type: "object",
       properties: {
@@ -145,7 +145,7 @@ export const WHITEBOARD_TOOL_SPECS: ModelToolInput[] = [
   {
     name: "whiteboard_insert",
     description:
-      "Add new html to the page without rewriting it, such as a <section> with an example or an exercise. Pass only the new html. It goes right after the learner's selection, or at the end of the page when there is none.",
+      "Add new html to the page without rewriting it, such as a <section> with an example or an exercise. Pass only the new html. It goes right after the learner's selection, or at the end of the page when there is none. LaTeX in \\( \\) or \\[ \\] renders by itself.",
     inputSchema: {
       type: "object",
       properties: {

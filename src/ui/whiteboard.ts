@@ -1,4 +1,5 @@
 import { BOARD_COMPONENTS, type BoardComponent, type BoardSources, type SelectionAnchor } from "../types.ts";
+import { BOARD_MODULES } from "./board-modules.ts";
 
 export const START_HEADING = "What do you want to learn?";
 export const SNAPSHOT_TEXT_LIMIT = 8_000;
@@ -104,7 +105,7 @@ export const SELECTION_BRIDGE = `(() => {
 })();`;
 
 const FRAME_CSP =
-  "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: https:;";
+  "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: https:; font-src data:;";
 
 export function emptyBoard(): BoardSources {
   return { html: "", css: "", js: "", svg: "", json: "" };
@@ -137,22 +138,28 @@ export function assembleBoardDocument(sources: BoardSources): string {
     ? `<div id="lesson-svg">${sources.svg}</div>\n`
     : "";
   const data = escapeScriptClose(`globalThis.lessonData = ${lessonDataLiteral(sources.json)};`);
+  // Prefilled modules: their style comes before the lesson css so the lesson can override it.
+  const moduleStyles = BOARD_MODULES.map((module) => `<style>${escapeStyleClose(module.style)}</style>\n`).join("");
+  const moduleScripts = BOARD_MODULES.map(
+    (module) => `<script>${escapeScriptClose(module.script)}</script>\n<script>${escapeScriptClose(module.boot)}</script>\n`,
+  ).join("");
+  const moduleAfter = BOARD_MODULES.map((module) => `\n<script>${escapeScriptClose(module.after)}</script>`).join("");
   return `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="${FRAME_CSP}">
-<style>
+${moduleStyles}<style>
 ${escapeStyleClose(sources.css)}
 </style>
 </head>
 <body>
 ${svg}${sources.html}
 <script>${data}</script>
-<script>${SELECTION_BRIDGE}</script>
+${moduleScripts}<script>${SELECTION_BRIDGE}</script>
 <script>
 ${escapeScriptClose(sources.js)}
-</script>
+</script>${moduleAfter}
 </body>
 </html>`;
 }

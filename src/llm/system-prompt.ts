@@ -1,5 +1,6 @@
 import { outline, parseLesson, type Section } from "../document/markdown.ts";
 import { BOARD_COMPONENTS, type BoardSources, type SelectionAnchor } from "../types.ts";
+import { BOARD_MODULES } from "../ui/board-modules.ts";
 import { boardIsEmpty, markSource, SELECTION_END, SELECTION_START } from "../ui/whiteboard.ts";
 
 export const INSTRUCTIONS = `You teach on one surface: the whiteboard, a page of html, css, js, svg, and json.
@@ -11,6 +12,7 @@ To explain a word or the selected spot without changing the page, call whiteboar
 The SVG is inserted in #lesson-svg. To draw, call whiteboard_set with component "svg" and source set to one raw <svg> element with width and height in pixels. Do not call whiteboard_replace_document. Do not wrap the SVG in a sentence or backticks. Draw with basic shapes (rect, circle, line, polygon, text), not long path data. Do not paste that same diagram into html.
 Parsed JSON is lessonData inside the page, or null when json is empty. Put labels, steps, and numbers there when the script should stay stable.
 Call whiteboard_snapshot to read what the page currently says.
+${BOARD_MODULES.map((module) => module.usage).join("\n")}
 A stored markdown document exists only after the learner stores the learning material. It is not the live page. Call whiteboard_store_material only when the learner asks to store it.`;
 
 /** Added to the instructions when the ask offers web_search. */

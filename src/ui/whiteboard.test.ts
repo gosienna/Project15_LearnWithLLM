@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { describe, expect, it } from "vitest";
 import type { SelectionAnchor } from "../types.ts";
+import { inlineKatexFonts, KATEX_MODULE } from "./board-modules.ts";
 import {
   assembleBoardDocument,
   boardDraft,
@@ -66,6 +67,24 @@ describe("whiteboard frame", () => {
     expect(doc.indexOf(SELECTION_BRIDGE)).toBeGreaterThan(0);
     expect(doc.indexOf(SELECTION_BRIDGE)).toBeLessThan(doc.indexOf("lessonScript();"));
     expect(SELECTION_BRIDGE).not.toMatch(/<\/script/i);
+  });
+
+  it("prefills KaTeX before the selection bridge and renders math after the lesson script", () => {
+    const doc = assembleBoardDocument({ ...emptyBoard(), html: String.raw`<p>\(x^2\)</p>`, css: "p { color: red; }", js: "lessonScript();" });
+    expect(doc).toContain("font-src data:");
+    expect(doc.indexOf(KATEX_MODULE.style)).toBeGreaterThan(0);
+    expect(doc.indexOf(KATEX_MODULE.style)).toBeLessThan(doc.indexOf("p { color: red; }"));
+    expect(doc.indexOf(KATEX_MODULE.boot)).toBeGreaterThan(doc.indexOf(KATEX_MODULE.script));
+    expect(doc.indexOf(KATEX_MODULE.boot)).toBeLessThan(doc.indexOf(SELECTION_BRIDGE));
+    expect(doc.lastIndexOf("renderMath();")).toBeGreaterThan(doc.indexOf("lessonScript();"));
+    for (const part of [KATEX_MODULE.script, KATEX_MODULE.boot, KATEX_MODULE.style]) expect(part).not.toMatch(/<\/(script|style)/i);
+  });
+
+  it("inlines every KaTeX font as one woff2 data URI", () => {
+    expect(KATEX_MODULE.style).not.toContain("url(fonts/");
+    expect(KATEX_MODULE.style).toContain("data:font/woff2;base64,");
+    const css = '@font-face{src:url(fonts/A-B.woff2) format("woff2"),url(fonts/A-B.woff) format("woff")}';
+    expect(inlineKatexFonts(css, { "/x/fonts/A-B.woff2": "data:x" })).toBe('@font-face{src:url(data:x) format("woff2")}');
   });
 
   it("asks for the first question on a blank board", () => {

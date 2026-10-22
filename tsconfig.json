@@ -11,6 +11,7 @@
     "types": ["vite/client"],
     "skipLibCheck": true,
     "isolatedModules": true,
+    "resolveJsonModule": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "verbatimModuleSyntax": true

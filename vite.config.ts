@@ -38,5 +38,7 @@ export default defineConfig({
   },
   test: {
     environment: "node",
+    // The board inlines KaTeX's css as text; vitest empties css imports unless they are processed.
+    css: { include: [/katex/] },
   },
 });

@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { describe, expect, it } from "vitest";
 import { renderSources, type SourceContent } from "./sources.ts";
+import { KATEX_MODULE } from "./board-modules.ts";
 import { renderWhiteboard } from "./whiteboard.ts";
 
 const content: SourceContent = { html: "<h1>Hi</h1>", css: "h1 { color: red; }", js: "", svg: "", json: "", material: "" };
@@ -28,7 +29,7 @@ describe("board source tabs", () => {
     const frame = v.board.querySelector("iframe");
     renderSources(v, content, "debug");
     const tabs = [...v.tabs.querySelectorAll<HTMLButtonElement>(".board-tab")];
-    expect(tabs.map((tab) => tab.firstChild?.textContent)).toEqual(["Preview", "HTML", "CSS", "JS", "SVG", "JSON", "Material"]);
+    expect(tabs.map((tab) => tab.firstChild?.textContent)).toEqual(["Preview", "HTML", "CSS", "JS", "SVG", "JSON", "Modules", "Material"]);
     tabs[2]!.click();
     expect(v.board.hidden).toBe(true);
     expect(v.pane.querySelector(".source-code")?.textContent).toBe("h1 { color: red; }");
@@ -40,6 +41,22 @@ describe("board source tabs", () => {
     renderSources(v, content, "clean");
     expect(v.board.hidden).toBe(false);
     expect(v.board.querySelector("iframe")).toBe(frame);
+  });
+
+  it("shows the prefilled modules and what the model is told about them", () => {
+    const v = view();
+    renderSources(v, content, "debug");
+    const tab = [...v.tabs.querySelectorAll<HTMLButtonElement>(".board-tab")].find((button) => button.firstChild?.textContent === "Modules")!;
+    tab.click();
+    const card = v.pane.querySelector(".module-card")!;
+    expect(card.querySelector(".module-title")?.textContent).toBe(`KaTeX ${KATEX_MODULE.version}`);
+    expect(card.querySelector(".module-usage")?.textContent).toBe(KATEX_MODULE.usage);
+    expect(card.querySelector(".source-code")?.textContent).toBe(KATEX_MODULE.boot);
+    const library = card.querySelector<HTMLDetailsElement>("details")!;
+    expect(library.querySelector("code")?.textContent).toBe("");
+    library.open = true;
+    library.dispatchEvent(new Event("toggle"));
+    expect(library.querySelector("code")?.textContent).toBe(KATEX_MODULE.script);
   });
 
   it("keeps an unsaved prompt edit through repaints", () => {

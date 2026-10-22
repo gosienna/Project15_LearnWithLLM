@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { serializeLesson } from "../document/markdown.ts";
 import type { SelectionAnchor } from "../types.ts";
 import { emptyBoard, SELECTION_END, SELECTION_START } from "../ui/whiteboard.ts";
+import { KATEX_MODULE } from "../ui/board-modules.ts";
 import { buildPrompt, estimateTokens, INSTRUCTIONS, sourceWindow, WEB_SEARCH_INSTRUCTIONS, whiteboardPreface } from "./system-prompt.ts";
 
 function anchor(overrides: Partial<SelectionAnchor> = {}): SelectionAnchor {
@@ -26,6 +27,12 @@ describe("system prompt", () => {
     expect(system).toContain("lessonData");
     expect(system).not.toContain("# Stored learning material");
     expect(prompt).toBe("Teach me cells");
+  });
+
+  it("tells the model the page already loads KaTeX", () => {
+    expect(INSTRUCTIONS).toContain(KATEX_MODULE.usage);
+    expect(KATEX_MODULE.usage).toContain("renderMath(element)");
+    expect(KATEX_MODULE.usage).toContain(String.raw`\( … \)`);
   });
 
   it("reports source lengths and does not inline the page without a selection", () => {

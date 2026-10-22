@@ -1,4 +1,5 @@
 import { BOARD_COMPONENTS, type BoardComponent, type BoardSources, type PromptMessage, type SelectionAnchor, type TurnTrace } from "../types.ts";
+import { BOARD_MODULES, type BoardModule } from "./board-modules.ts";
 import type { UiMode } from "./mode.ts";
 import {
   releaseRequestEditor,
@@ -9,9 +10,9 @@ import {
 } from "./request-editor.ts";
 import { renderTraceList } from "./trace-view.ts";
 
-export type SourceTab = "preview" | BoardComponent | "material" | "system" | "request" | "trace";
+export type SourceTab = "preview" | BoardComponent | "modules" | "material" | "system" | "request" | "trace";
 
-export const SOURCE_TABS: readonly SourceTab[] = ["preview", ...BOARD_COMPONENTS, "material", "system", "request", "trace"];
+export const SOURCE_TABS: readonly SourceTab[] = ["preview", ...BOARD_COMPONENTS, "modules", "material", "system", "request", "trace"];
 
 const INPUT_TABS: readonly SourceTab[] = ["system", "request", "trace"];
 
@@ -22,6 +23,7 @@ const TAB_LABELS: Record<SourceTab, string> = {
   js: "JS",
   svg: "SVG",
   json: "JSON",
+  modules: "Modules",
   material: "Material",
   system: "System prompt",
   request: "Next request",
@@ -126,6 +128,11 @@ export function renderSources(view: SourceView, content: SourceContent, mode: Ui
     return;
   }
 
+  if (tab === "modules") {
+    renderModules(view.pane);
+    return;
+  }
+
   const text = content[tab];
   const key = `${tab}\u0000${text}`;
   if (shown.get(view.pane) === key) return;
@@ -140,12 +147,7 @@ export function renderSources(view: SourceView, content: SourceContent, mode: Ui
   copy.className = "source-copy";
   copy.textContent = "Copy";
   copy.disabled = !text;
-  copy.addEventListener("click", () => {
-    void navigator.clipboard?.writeText(text).then(
-      () => (copy.textContent = "Copied"),
-      () => (copy.textContent = "Copy failed"),
-    );
-  });
+  copy.addEventListener("click", () => copyText(copy, text));
   header.append(meta, copy);
 
   const pre = document.createElement("pre");
@@ -157,9 +159,94 @@ export function renderSources(view: SourceView, content: SourceContent, mode: Ui
   view.pane.replaceChildren(header, pre);
 }
 
-/** Characters of a source, or the number of traces; nothing for the other tabs. */
+function copyText(button: HTMLButtonElement, text: string): void {
+  void navigator.clipboard?.writeText(text).then(
+    () => (button.textContent = "Copied"),
+    () => (button.textContent = "Copy failed"),
+  );
+}
+
+function kilobytes(text: string): string {
+  return `${Math.round(text.length / 1024)} KB`;
+}
+
+/** A labelled read-only block with a Copy button. Lazy blocks fill their code only when opened. */
+function moduleBlock(label: string, text: string, lazy: boolean): HTMLElement {
+  const header = document.createElement("div");
+  header.className = "source-header";
+  const meta = document.createElement("p");
+  meta.className = "source-meta";
+  meta.textContent = `${label} · ${text.length} characters`;
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.className = "source-copy";
+  copy.textContent = "Copy";
+  copy.addEventListener("click", (event) => {
+    event.preventDefault();
+    copyText(copy, text);
+  });
+  header.append(meta, copy);
+  const pre = document.createElement("pre");
+  pre.className = "source-code";
+  const code = document.createElement("code");
+  pre.append(code);
+  if (!lazy) {
+    code.textContent = text;
+    const block = document.createElement("div");
+    block.append(header, pre);
+    return block;
+  }
+  const details = document.createElement("details");
+  details.className = "module-source";
+  const summary = document.createElement("summary");
+  summary.append(header);
+  details.append(summary, pre);
+  details.addEventListener("toggle", () => {
+    if (details.open && !code.textContent) code.textContent = text;
+  });
+  return details;
+}
+
+function moduleCard(module: BoardModule): HTMLElement {
+  const card = document.createElement("article");
+  card.className = "module-card";
+  const title = document.createElement("h3");
+  title.className = "module-title";
+  title.textContent = `${module.name} ${module.version}`;
+  const meta = document.createElement("p");
+  meta.className = "source-meta";
+  meta.textContent = `Prefilled in every board · script ${kilobytes(module.script)} · style ${kilobytes(module.style)} · read-only`;
+  const told = document.createElement("p");
+  told.className = "module-usage-label";
+  told.textContent = "Told to the model";
+  const usage = document.createElement("blockquote");
+  usage.className = "module-usage";
+  usage.textContent = module.usage;
+  card.append(
+    title,
+    meta,
+    told,
+    usage,
+    moduleBlock("Boot script", module.boot, false),
+    moduleBlock("After the lesson script", module.after, false),
+    moduleBlock("Library script", module.script, true),
+    moduleBlock("Library style, fonts inlined", module.style, true),
+  );
+  return card;
+}
+
+/** The libraries every board loads, as the frame gets them and as the model is told about them. */
+function renderModules(pane: HTMLElement): void {
+  const key = `modules\u0000${BOARD_MODULES.map((module) => module.id).join(",")}`;
+  if (shown.get(pane) === key) return;
+  shown.set(pane, key);
+  pane.replaceChildren(...BOARD_MODULES.map(moduleCard));
+}
+
+/** Characters of a source, the number of modules, or the number of traces; nothing for the other tabs. */
 function tabCount(id: SourceTab, content: SourceContent, inputs?: PromptInputs): number | undefined {
   if (id === "trace") return inputs?.traces?.().length ?? 0;
+  if (id === "modules") return BOARD_MODULES.length;
   if (id === "preview" || id === "system" || id === "request") return undefined;
   return content[id].length;
 }
