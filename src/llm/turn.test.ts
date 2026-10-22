@@ -291,8 +291,8 @@ describe("tutor", () => {
     expect(html).not.toContain("LEARNER SELECTION");
     const trace = traces.at(-1)?.trace;
     expect(trace?.question).toBe("What is chlorophyll?");
-    expect(trace?.selection).toEqual(anchor);
-    expect(trace?.request?.selection).toEqual(anchor);
+    expect(trace?.selection).toEqual([anchor]);
+    expect(trace?.request?.selection).toEqual([anchor]);
     expect(trace?.request?.prompt).toBe(seen);
   });
 

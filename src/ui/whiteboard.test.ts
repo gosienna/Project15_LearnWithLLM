@@ -5,10 +5,13 @@ import { inlineKatexFonts, KATEX_MODULE } from "./board-modules.ts";
 import {
   assembleBoardDocument,
   boardDraft,
+  EDIT_SURROUND_NOTE,
+  editSlice,
   emptyBoard,
   insertNote,
   markSource,
   readAnchor,
+  readAnchors,
   renderWhiteboard,
   resolveBoardImages,
   SELECTION_BRIDGE,
@@ -201,5 +204,167 @@ describe("selection anchors", () => {
     expect(readAnchor({ ...good, quote: null })).toBeNull();
     expect(readAnchor("text")).toBeNull();
     expect(readAnchor({ ...good, selector: "x".repeat(2000) })?.selector).toHaveLength(600);
+    expect(readAnchors([good, { ...good, kind: "nope" }])).toEqual([good]);
+    expect(readAnchors(good)).toEqual([good]);
+  });
+});
+
+describe("edit slices", () => {
+  it("uses the selected words when they occur once", () => {
+    const sources = { ...emptyBoard(), html: "<p>Leaves hold chlorophyll.</p>" };
+    expect(editSlice(sources, anchor("body > p:nth-of-type(1)", {
+      kind: "text",
+      quote: { exact: "chlorophyll", prefix: "Leaves hold ", suffix: "." },
+    }))).toEqual({ component: "html", find: "chlorophyll" });
+  });
+
+  it("widens a repeated word until the slice is unique", () => {
+    const sources = { ...emptyBoard(), html: "<p>red apple</p><p>green apple</p>" };
+    const slice = editSlice(sources, anchor("body > p:nth-of-type(1)", {
+      kind: "text",
+      tag: "p",
+      quote: { exact: "apple", prefix: "red ", suffix: "" },
+    }));
+    expect(slice.find).toContain("apple");
+    expect(slice.find).not.toContain("green");
+    expect(sources.html.indexOf(slice.find)).toBe(sources.html.lastIndexOf(slice.find));
+    expect(slice.note).toBe(EDIT_SURROUND_NOTE);
+  });
+
+  it("recovers an image tag and an svg shape from the stored source", () => {
+    const sources = {
+      ...emptyBoard(),
+      html: '<p>Hi</p><img src="board-image:img1" alt="leaf">',
+      svg: '<svg width="10" height="10"><rect width="4" height="4"></rect></svg>',
+    };
+    const image = editSlice(sources, anchor("body > img:nth-of-type(1)", {
+      kind: "element",
+      tag: "img",
+      quote: { exact: "", prefix: "", suffix: "" },
+    }));
+    expect(image.error).toBeUndefined();
+    expect(image.find).toContain("board-image:img1");
+    expect(sources.html.split(image.find)).toHaveLength(2);
+
+    const shape = editSlice(sources, anchor("#lesson-svg > svg:nth-of-type(1) > rect:nth-of-type(1)", {
+      kind: "element",
+      component: "svg",
+      tag: "rect",
+      quote: { exact: "", prefix: "", suffix: "" },
+    }));
+    expect(shape.component).toBe("svg");
+    expect(shape.find).toContain("<rect");
+    expect(sources.svg.split(shape.find)).toHaveLength(2);
+  });
+
+  it("refuses a selection the stored source does not contain", () => {
+    const sources = { ...emptyBoard(), html: "<p>hold <em>chlorophyll</em></p><div id='app'></div>" };
+    const split = editSlice(sources, anchor("body > p:nth-of-type(1)", {
+      kind: "text",
+      quote: { exact: "hold chlorophyll", prefix: "", suffix: "" },
+    }));
+    expect(split.error).toContain("Tags sit in the middle");
+    const built = editSlice(sources, anchor("#app > button:nth-of-type(1)", {
+      kind: "text",
+      quote: { exact: "missing", prefix: "", suffix: "" },
+    }));
+    expect(built.error).toContain("lesson script");
+  });
+});
+
+describe("selection gestures", () => {
+  const messages: { type?: string; anchors?: { tag?: string; kind?: string; component?: string }[] }[] = [];
+
+  function place(el: Element, x: number, y: number, w: number, h: number): void {
+    Object.defineProperty(el, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({ x, y, left: x, top: y, right: x + w, bottom: y + h, width: w, height: h, toJSON() { return {}; } }),
+    });
+  }
+
+  function pointer(type: string, target: Element, x: number, y: number): void {
+    target.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 1, button: 0 }));
+  }
+
+  async function settle(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  function highlighted(): string[] {
+    return [...document.querySelectorAll("[data-ask-highlight]")].map((el) => el.id);
+  }
+
+  it("clicks a picture or shape, drags a box, and keeps text drags as text", async () => {
+    window.addEventListener("message", (event) => {
+      const data = event.data as { source?: string; type?: string; anchors?: { tag?: string; kind?: string; component?: string }[] };
+      if (data?.source === "learn-with-llm") messages.push(data);
+    });
+    window.eval(SELECTION_BRIDGE);
+    document.body.innerHTML = `<button id="go">Go</button><section id="wrap"><img id="pic" alt="leaf"><p id="words">Hello chlorophyll</p></section><div id="lesson-svg"><svg id="drawing"><rect id="shape" width="10" height="10"></rect></svg></div>`;
+    const pic = document.querySelector("#pic")!;
+    const words = document.querySelector("#words")!;
+    const wrap = document.querySelector("#wrap")!;
+    const shape = document.querySelector("#shape")!;
+    const drawing = document.querySelector("#drawing")!;
+    const go = document.querySelector("#go")!;
+    place(wrap, 0, 0, 200, 200);
+    place(pic, 10, 10, 40, 40);
+    place(words, 10, 60, 100, 20);
+    place(drawing, 10, 120, 80, 40);
+    place(shape, 20, 130, 20, 20);
+    place(go, 300, 10, 40, 20);
+
+    pointer("pointerdown", pic, 20, 20);
+    pointer("pointerup", pic, 20, 20);
+    pic.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: 20, clientY: 20 }));
+    pic.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: 20, clientY: 20 }));
+    await settle();
+    expect(messages.at(-1)?.anchors?.map((item) => item.tag)).toEqual(["img"]);
+    expect(highlighted()).toEqual(["pic"]);
+
+    pointer("pointerdown", shape, 25, 135);
+    pointer("pointerup", shape, 25, 135);
+    shape.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    shape.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await settle();
+    expect(messages.at(-1)?.anchors?.[0]).toMatchObject({ tag: "rect", component: "svg", kind: "element" });
+    expect(highlighted()).toEqual(["shape"]);
+
+    const before = messages.length;
+    pointer("pointerdown", go, 310, 15);
+    pointer("pointerup", go, 310, 15);
+    go.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    go.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await settle();
+    expect(messages.slice(before).some((message) => message.anchors?.some((item) => item.tag === "button"))).toBe(false);
+    expect(go.hasAttribute("data-ask-highlight")).toBe(false);
+
+    messages.length = 0;
+    pointer("pointerdown", pic, 12, 12);
+    pointer("pointermove", pic, 110, 80);
+    pointer("pointerup", pic, 110, 80);
+    pic.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    pic.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await settle();
+    expect(document.querySelector("[data-ask-marquee]")).toBeNull();
+    expect(messages.at(-1)?.anchors?.map((item) => item.tag)).toEqual(["img", "p"]);
+    expect(highlighted().sort()).toEqual(["pic", "words"]);
+    expect(wrap.hasAttribute("data-ask-highlight")).toBe(false);
+
+    messages.length = 0;
+    pointer("pointerdown", words, 20, 70);
+    pointer("pointermove", words, 180, 200);
+    pointer("pointerup", words, 180, 200);
+    expect(document.querySelector("[data-ask-marquee]")).toBeNull();
+    const range = document.createRange();
+    range.selectNodeContents(words);
+    const selection = document.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    words.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    await settle();
+    expect(messages.at(-1)?.anchors?.[0]?.kind).toBe("text");
+    expect(highlighted()).toEqual(["words"]);
   });
 });

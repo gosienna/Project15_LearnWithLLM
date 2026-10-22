@@ -12,15 +12,18 @@ const BRIDGE_SOURCE = "learn-with-llm";
 
 /**
  * Runs inside the sandboxed board. The parent cannot read the frame, so this reports a text
- * selection, or an Alt+clicked element, with postMessage. A plain click still reaches the lesson.
+ * selection, a clicked picture or other non-text element, or every element inside a drag box,
+ * with postMessage. Links and form controls keep their own clicks.
  */
 export const SELECTION_BRIDGE = `(() => {
-  const CONTEXT = 60, EXACT = 500, OUTER = 1500;
-  const post = (type, anchor) => parent.postMessage({ source: "${BRIDGE_SOURCE}", type, anchor }, "*");
+  const CONTEXT = 60, EXACT = 500, OUTER = 1500, DRAG = 4;
+  const NON_TEXT = new Set(["img", "picture", "svg", "canvas", "video", "audio", "rect", "circle", "ellipse", "line", "polygon", "polyline", "path", "image", "use"]);
+  const post = (type, extra) => parent.postMessage(Object.assign({ source: "${BRIDGE_SOURCE}", type }, extra || {}), "*");
   const style = document.createElement("style");
-  style.textContent = "[data-ask-highlight]{outline:2px solid #c7781f !important;outline-offset:2px;}";
+  style.textContent = "[data-ask-highlight]{outline:2px solid #c7781f !important;outline-offset:2px;}[data-ask-marquee]{position:fixed;z-index:5;border:1px solid #c7781f;background:rgba(199,120,31,.12);pointer-events:none;}";
   document.head.append(style);
   const unmark = () => document.querySelectorAll("[data-ask-highlight]").forEach((el) => el.removeAttribute("data-ask-highlight"));
+  const mark = (els) => { unmark(); els.forEach((el) => el.setAttribute("data-ask-highlight", "")); };
   const squash = (text) => text.replace(/\\s+/g, " ");
   const clip = (text, n) => (text.length > n ? text.slice(0, n) + "…" : text);
   const step = (el) => {
@@ -63,17 +66,96 @@ export const SELECTION_BRIDGE = `(() => {
     after.setStart(range.endContainer, range.endOffset);
     return anchorFor("text", el, exact, before.toString(), after.toString(), range.getBoundingClientRect());
   };
+  const interactive = (el) => !!el.closest("a, button, input, textarea, select, summary, label");
+  const nonText = (el) => {
+    if (!el || el === document.body || el === document.documentElement) return false;
+    if (interactive(el)) return false;
+    if (NON_TEXT.has(el.localName)) return true;
+    return !(el.textContent || "").trim();
+  };
+  const intersects = (a, b) => a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+  const inBox = (rect) => {
+    const hits = [];
+    document.body.querySelectorAll("*").forEach((el) => {
+      if (el.hasAttribute("data-ask-marquee") || el.localName === "script" || el.localName === "style") return;
+      if (interactive(el)) return;
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) return;
+      if (!intersects(rect, { left: r.left, top: r.top, right: r.right, bottom: r.bottom })) return;
+      hits.push(el);
+    });
+    return hits.filter((el) => !hits.some((other) => other !== el && el.contains(other)));
+  };
+  const highlightText = () => {
+    const sel = getSelection();
+    let el = sel && sel.rangeCount ? sel.getRangeAt(0).commonAncestorContainer : null;
+    if (el && el.nodeType !== 1) el = el.parentElement;
+    if (el && el !== document.body && el !== document.documentElement) el.setAttribute("data-ask-highlight", "");
+  };
+  let drag = null;
+  let boxGesture = false;
+  const endDrag = (event) => {
+    if (!drag || event.pointerId !== drag.id) return;
+    const state = drag;
+    drag = null;
+    document.documentElement.style.userSelect = "";
+    if (!state.active) return;
+    if (state.box) state.box.remove();
+    const rect = {
+      left: Math.min(state.x, event.clientX),
+      top: Math.min(state.y, event.clientY),
+      right: Math.max(state.x, event.clientX),
+      bottom: Math.max(state.y, event.clientY),
+    };
+    const hits = inBox(rect);
+    boxGesture = true;
+    getSelection()?.removeAllRanges();
+    if (!hits.length) { unmark(); post("clear"); return; }
+    mark(hits);
+    post("selection", { anchors: hits.map((el) => anchorFor("element", el, squash(el.textContent || ""), "", "", el.getBoundingClientRect())) });
+  };
+  document.addEventListener("pointerdown", (event) => {
+    if (event.altKey || event.button !== 0) return;
+    const el = event.target instanceof Element ? event.target : null;
+    if (!el || interactive(el)) return;
+    if (el !== document.body && el !== document.documentElement && !nonText(el)) return;
+    drag = { id: event.pointerId, x: event.clientX, y: event.clientY, active: false, box: null };
+  }, true);
+  document.addEventListener("pointermove", (event) => {
+    if (!drag || event.pointerId !== drag.id) return;
+    if (!drag.active && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < DRAG) return;
+    if (!drag.active) {
+      drag.active = true;
+      const box = document.createElement("div");
+      box.setAttribute("data-ask-marquee", "");
+      document.body.append(box);
+      drag.box = box;
+      document.documentElement.style.userSelect = "none";
+    }
+    event.preventDefault();
+    drag.box.style.left = Math.min(drag.x, event.clientX) + "px";
+    drag.box.style.top = Math.min(drag.y, event.clientY) + "px";
+    drag.box.style.width = Math.abs(event.clientX - drag.x) + "px";
+    drag.box.style.height = Math.abs(event.clientY - drag.y) + "px";
+  }, true);
+  document.addEventListener("pointerup", endDrag, true);
+  document.addEventListener("pointercancel", endDrag, true);
   document.addEventListener("mouseup", (event) => {
     if (event.altKey) return;
     setTimeout(() => {
+      if (boxGesture) { boxGesture = false; return; }
       const anchor = fromSelection();
       unmark();
-      if (anchor) post("selection", anchor);
-      else post("clear");
+      if (!anchor) { post("clear"); return; }
+      highlightText();
+      post("selection", { anchors: [anchor] });
     }, 0);
   });
   document.addEventListener("keyup", (event) => {
     if (event.key === "Escape") {
+      if (drag && drag.box) drag.box.remove();
+      drag = null;
+      document.documentElement.style.userSelect = "";
       unmark();
       getSelection()?.removeAllRanges();
       post("clear");
@@ -81,19 +163,22 @@ export const SELECTION_BRIDGE = `(() => {
     }
     if (!event.shiftKey) return;
     const anchor = fromSelection();
-    if (anchor) post("selection", anchor);
+    if (!anchor) return;
+    unmark();
+    highlightText();
+    post("selection", { anchors: [anchor] });
   });
   document.addEventListener("click", (event) => {
-    if (!event.altKey) return;
+    if (boxGesture) { event.preventDefault(); event.stopPropagation(); return; }
     const el = event.target instanceof Element ? event.target : null;
     if (!el || el === document.body || el === document.documentElement) return;
+    if (!event.altKey && !nonText(el)) return;
     event.preventDefault();
     event.stopPropagation();
     getSelection()?.removeAllRanges();
-    unmark();
-    const anchor = anchorFor("element", el, squash(el.textContent || ""), "", "", el.getBoundingClientRect());
-    el.setAttribute("data-ask-highlight", "");
-    post("selection", anchor);
+    mark([el]);
+    boxGesture = true;
+    post("selection", { anchors: [anchorFor("element", el, squash(el.textContent || ""), "", "", el.getBoundingClientRect())] });
   }, true);
   addEventListener("message", (event) => {
     if (event.source !== parent || !event.data || event.data.source !== "${BRIDGE_SOURCE}") return;
@@ -266,6 +351,34 @@ export interface MarkedSource {
   marked: boolean;
 }
 
+/** Every selected element marked in one pass, so a box selection keeps each marker. */
+export function markSelections(sources: BoardSources, anchors: readonly SelectionAnchor[]): {
+  html: string;
+  svg: string;
+  matched: boolean[];
+} {
+  const matched = anchors.map(() => false);
+  const board = parseBoard(sources);
+  if (!board) return { html: sources.html, svg: sources.svg, matched };
+  anchors.forEach((anchor, index) => {
+    const target = findTarget(board, anchor.selector);
+    if (!target) return;
+    matched[index] = true;
+    const begin = board.doc.createComment(SELECTION_START.slice(4, -3));
+    const end = board.doc.createComment(SELECTION_END.slice(4, -3));
+    if (target === board.slot) {
+      target.prepend(begin);
+      target.append(end);
+    } else {
+      target.before(begin);
+      target.after(end);
+    }
+  });
+  const svg = board.slot?.innerHTML ?? "";
+  board.slot?.remove();
+  return { html: board.doc.body.innerHTML, svg, matched };
+}
+
 /** The source the selection lives in, with the selected element between the selection markers. */
 export function markSource(sources: BoardSources, anchor: SelectionAnchor): MarkedSource {
   const unmarked: MarkedSource = { component: anchor.component, text: sources[anchor.component], marked: false };
@@ -300,6 +413,178 @@ function paragraphs(text: string): string[] {
 function noteMarkup(question: string, reply: string, about: string): string {
   const body = paragraphs(reply).map((part) => `<p style="margin:0 0 4px;">${escapeHtml(part)}</p>`).join("");
   return `<aside class="learner-note" data-about="${escapeHtml(about)}" style="${NOTE_STYLE}"><p style="margin:0 0 4px;font-weight:600;">${escapeHtml(question)}</p>${body}</aside>`;
+}
+
+export const EDIT_SURROUND_NOTE = "Included surrounding source so the change hits only this spot.";
+
+const SCRIPT_BUILT = "The lesson script may have built this element, so it isn't in the stored source.";
+const SPLIT_TAGS = "Tags sit in the middle of this selection, so it isn't one stretch of the stored source.";
+const NO_STRETCH = "This element isn't one stretch of the stored source.";
+
+export interface EditSlice {
+  component: "html" | "svg";
+  /** The exact source substring whiteboard_edit will find. Empty when the spot cannot be edited. */
+  find: string;
+  /** Why Confirm stays disabled for this row. */
+  error?: string;
+  /** Set when the field includes source around the selection so the match is unique. */
+  note?: string;
+}
+
+function indexesOf(source: string, needle: string): number[] {
+  const hits: number[] = [];
+  if (!needle) return hits;
+  let at = 0;
+  while ((at = source.indexOf(needle, at)) !== -1) {
+    hits.push(at);
+    at += needle.length;
+  }
+  return hits;
+}
+
+function collapsedAround(source: string, index: number, length: number): { before: string; after: string } {
+  const raw = (text: string) => text.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ");
+  return {
+    before: raw(source.slice(Math.max(0, index - 240), index)),
+    after: raw(source.slice(index + length, index + length + 240)),
+  };
+}
+
+function pickOccurrence(source: string, exact: string, prefix: string, suffix: string): number {
+  const hits = indexesOf(source, exact);
+  if (hits.length === 0) return -1;
+  let best = hits[0]!;
+  let bestScore = -1;
+  const wantPrefix = prefix.trim();
+  const wantSuffix = suffix.trim();
+  for (const hit of hits) {
+    const around = collapsedAround(source, hit, exact.length);
+    let score = 0;
+    if (wantPrefix && around.before.trimEnd().endsWith(wantPrefix)) score += 2;
+    else if (wantPrefix && around.before.includes(wantPrefix)) score += 1;
+    if (wantSuffix && around.after.trimStart().startsWith(wantSuffix)) score += 2;
+    else if (wantSuffix && around.after.includes(wantSuffix)) score += 1;
+    if (score > bestScore) {
+      bestScore = score;
+      best = hit;
+    }
+  }
+  return best;
+}
+
+/** If a bound sits inside a tag, move it to the edge of that tag so the field is not a cut tag. */
+function outsideTags(source: string, start: number, end: number): { start: number; end: number } {
+  const open = source.lastIndexOf("<", start);
+  const close = open === -1 ? -1 : source.indexOf(">", open);
+  if (open !== -1 && close >= start) start = open;
+  const openEnd = source.lastIndexOf("<", Math.max(start, end - 1));
+  const closeEnd = openEnd === -1 ? -1 : source.indexOf(">", openEnd);
+  if (openEnd !== -1 && openEnd < end && closeEnd >= end - 1) end = closeEnd + 1;
+  return { start, end };
+}
+
+/** Grow a raw window around index until it occurs once. The exact needle itself sets grew to false. */
+function uniqueWindow(source: string, index: number, length: number): { slice: string; grew: boolean } {
+  const exact = source.slice(index, index + length);
+  if (indexesOf(source, exact).length === 1) return { slice: exact, grew: false };
+  let pad = 1;
+  let start = index;
+  let end = index + length;
+  while (true) {
+    start = Math.max(0, index - pad);
+    end = Math.min(source.length, index + length + pad);
+    const slice = source.slice(start, end);
+    if (indexesOf(source, slice).length === 1 || (start === 0 && end === source.length)) break;
+    pad *= 2;
+  }
+  const snapped = outsideTags(source, start, end);
+  const slice = source.slice(snapped.start, snapped.end);
+  if (indexesOf(source, slice).length === 1) return { slice, grew: true };
+  return { slice: source.slice(start, end), grew: true };
+}
+
+const VOID_TAGS = new Set(["img", "br", "hr", "input", "image", "use", "link", "meta"]);
+
+function expandToTag(source: string, index: number): string | null {
+  const start = source.lastIndexOf("<", index);
+  if (start < 0 || source[start + 1] === "/") return null;
+  const name = /^<([A-Za-z][\w:-]*)/.exec(source.slice(start))?.[1];
+  if (!name) return null;
+  const openEnd = source.indexOf(">", start);
+  if (openEnd < 0) return null;
+  const open = source.slice(start, openEnd + 1);
+  if (open.endsWith("/>") || VOID_TAGS.has(name.toLowerCase())) return open;
+  const openRe = new RegExp(`<${name}\\b[^>]*>`, "gi");
+  const closeRe = new RegExp(`</${name}\\s*>`, "gi");
+  let depth = 1;
+  let cursor = openEnd + 1;
+  while (depth > 0 && cursor < source.length) {
+    openRe.lastIndex = cursor;
+    closeRe.lastIndex = cursor;
+    const nextOpen = openRe.exec(source);
+    const nextClose = closeRe.exec(source);
+    if (!nextClose) return null;
+    if (nextOpen && nextOpen.index < nextClose.index) {
+      depth += 1;
+      cursor = nextOpen.index + nextOpen[0].length;
+    } else {
+      depth -= 1;
+      cursor = nextClose.index + nextClose[0].length;
+      if (depth === 0) return source.slice(start, cursor);
+    }
+  }
+  return null;
+}
+
+function rawSliceForElement(source: string, el: Element): { slice: string; grew: boolean } | null {
+  const parsed = el.outerHTML;
+  const parsedHits = indexesOf(source, parsed);
+  if (parsedHits.length === 1) return { slice: parsed, grew: false };
+  if (parsedHits.length > 1) {
+    const same = [...el.ownerDocument.querySelectorAll(el.localName)].filter((node) => node.outerHTML === parsed);
+    const at = parsedHits[same.indexOf(el)];
+    if (at === undefined) return null;
+    return uniqueWindow(source, at, parsed.length);
+  }
+  for (const name of ["id", "src", "alt", "href"]) {
+    const value = el.getAttribute(name);
+    if (!value) continue;
+    for (const needle of [`${name}="${value}"`, `${name}='${value}'`]) {
+      const hits = indexesOf(source, needle);
+      if (hits.length !== 1) continue;
+      const tag = expandToTag(source, hits[0]!);
+      if (!tag) continue;
+      const tags = indexesOf(source, tag);
+      if (tags.length === 1) return { slice: tag, grew: false };
+      return uniqueWindow(source, tags[0]!, tag.length);
+    }
+  }
+  return null;
+}
+
+/**
+ * The stored-source substring a learner edit replaces. Text uses the selected words when they
+ * occur once. A picture or other element uses its stored tag. Nothing here reads the live frame.
+ */
+export function editSlice(sources: BoardSources, anchor: SelectionAnchor): EditSlice {
+  const component = anchor.component;
+  const source = sources[component];
+  const board = parseBoard(sources);
+  const target = board ? findTarget(board, anchor.selector) : null;
+  if (anchor.kind === "text" && anchor.quote.exact) {
+    const hits = indexesOf(source, anchor.quote.exact);
+    if (hits.length === 1) return { component, find: anchor.quote.exact };
+    if (hits.length > 1) {
+      const at = pickOccurrence(source, anchor.quote.exact, anchor.quote.prefix, anchor.quote.suffix);
+      const window = uniqueWindow(source, at, anchor.quote.exact.length);
+      return { component, find: window.slice, ...(window.grew ? { note: EDIT_SURROUND_NOTE } : {}) };
+    }
+    return { component, find: "", error: target ? SPLIT_TAGS : SCRIPT_BUILT };
+  }
+  if (!target) return { component, find: "", error: SCRIPT_BUILT };
+  const raw = rawSliceForElement(source, target);
+  if (!raw) return { component, find: "", error: NO_STRETCH };
+  return { component, find: raw.slice, ...(raw.grew ? { note: EDIT_SURROUND_NOTE } : {}) };
 }
 
 /** Removes selection markers the model copied from the source it read. */
@@ -351,8 +636,8 @@ export function insertNote(
 export interface BoardHandlers {
   /** The learner sent the first question of an empty board. */
   onStart?: (question: string) => void;
-  /** A selection in the lesson, or null when the learner cleared it. */
-  onSelection?: (anchor: SelectionAnchor | null) => void;
+  /** The current selection, or null when the learner cleared it. */
+  onSelection?: (anchors: SelectionAnchor[] | null) => void;
   /** The start field changed. */
   onDraft?: () => void;
 }
@@ -368,6 +653,15 @@ function renderKey(sources: BoardSources, images: BoardImageSources): string {
 
 function text(value: unknown, limit: number): string | null {
   return typeof value === "string" ? value.slice(0, limit) : null;
+}
+
+/** One anchor, or a list of them. A single object from an older frame still counts as one. */
+export function readAnchors(value: unknown): SelectionAnchor[] {
+  const list = Array.isArray(value) ? value : value == null ? [] : [value];
+  return list.flatMap((item) => {
+    const anchor = readAnchor(item);
+    return anchor ? [anchor] : [];
+  });
 }
 
 /** The lesson script can post too, so only a well-formed anchor passes, with every string capped. */
@@ -404,13 +698,13 @@ function listen(host: HTMLElement): void {
   window.addEventListener("message", (event) => {
     const frame = host.querySelector<HTMLIFrameElement>(".board-frame");
     if (!frame || event.source !== frame.contentWindow) return;
-    const data = event.data as { source?: unknown; type?: unknown; anchor?: unknown } | null;
+    const data = event.data as { source?: unknown; type?: unknown; anchor?: unknown; anchors?: unknown } | null;
     if (data?.source !== BRIDGE_SOURCE) return;
     const onSelection = handlersFor.get(host)?.onSelection;
     if (data.type === "clear") onSelection?.(null);
     if (data.type !== "selection") return;
-    const anchor = readAnchor(data.anchor);
-    if (anchor) onSelection?.(anchor);
+    const anchors = readAnchors(data.anchors ?? data.anchor);
+    if (anchors.length) onSelection?.(anchors);
   });
 }
 
@@ -428,7 +722,7 @@ function startForm(host: HTMLElement): HTMLFormElement {
   heading.textContent = START_HEADING;
   const hint = document.createElement("p");
   hint.className = "board-start-hint";
-  hint.textContent = "Name a topic or ask a question. Later, select text on the lesson, or Alt+click a shape, to ask about that spot.";
+  hint.textContent = "Name a topic or ask a question. Later, select text, click a picture or shape, or drag a box around elements.";
   const field = document.createElement("textarea");
   field.className = "board-start-field";
   field.rows = 3;

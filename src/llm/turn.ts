@@ -1,16 +1,17 @@
 import { parseLesson } from "../document/markdown.ts";
 import type { TopicRepository } from "../storage/db.ts";
-import type {
-  CreateOptions,
-  LanguageModelAPI,
-  LanguageModelSession,
-  FetchImageFn,
-  PromptMessage,
-  SearchFn,
-  SelectionAnchor,
-  ToolDeclaration,
-  TopicRecord,
-  TurnTrace,
+import {
+  selectionList,
+  type CreateOptions,
+  type LanguageModelAPI,
+  type LanguageModelSession,
+  type FetchImageFn,
+  type PromptMessage,
+  type SearchFn,
+  type SelectionAnchor,
+  type ToolDeclaration,
+  type TopicRecord,
+  type TurnTrace,
 } from "../types.ts";
 import { boardIsEmpty, insertNote, stripSelectionMarkers, titleFromHtml } from "../ui/whiteboard.ts";
 import { buildPrompt, type BuiltPrompt } from "./system-prompt.ts";
@@ -106,8 +107,8 @@ export interface TutorDeps {
 }
 
 export interface AskOptions {
-  /** Where the learner pointed. Null for the first question and toolbar actions. */
-  anchor?: SelectionAnchor | null;
+  /** Where the learner pointed. One element, or every element in a box. Null for the first question and toolbar actions. */
+  anchor?: SelectionAnchor | readonly SelectionAnchor[] | null;
   /** Put a reply that changed nothing onto the board as a note. On by default. */
   note?: boolean;
 }
@@ -209,7 +210,12 @@ export class Tutor {
     else this.nextPrompts.delete(topicId);
   }
 
-  private build(topic: TopicRecord, question: string, anchor: SelectionAnchor | null, maxFullSections?: number): BuiltPrompt {
+  private build(
+    topic: TopicRecord,
+    question: string,
+    anchor: SelectionAnchor | readonly SelectionAnchor[] | null,
+    maxFullSections?: number,
+  ): BuiltPrompt {
     return buildPrompt({
       webSearch: !!this.deps.search?.(),
       imageTools: !!this.deps.fetchImage?.(),
@@ -238,7 +244,7 @@ export class Tutor {
   }
 
   /** The prompt the next ask sends for this question and selection. */
-  previewPrompt(topic: TopicRecord, question: string, anchor: SelectionAnchor | null): string {
+  previewPrompt(topic: TopicRecord, question: string, anchor: SelectionAnchor | readonly SelectionAnchor[] | null): string {
     return this.build(topic, question.trim(), anchor).prompt;
   }
 
@@ -257,7 +263,8 @@ export class Tutor {
   async ask(topicId: string, question: string, options: AskOptions = {}): Promise<void> {
     const trimmed = question.trim();
     if (!trimmed || this.busy) return;
-    const anchor = options.anchor ?? null;
+    const anchors = selectionList(options.anchor);
+    const anchor = anchors.at(-1) ?? null;
     const epoch = this.epoch;
     const alive = () => epoch === this.epoch;
     const model = this.deps.languageModel();
@@ -285,7 +292,7 @@ export class Tutor {
     const recorder = new TraceRecorder(this.deps.modelId?.() ?? null);
     recorder.trace.id = crypto.randomUUID();
     recorder.trace.question = trimmed;
-    if (anchor) recorder.trace.selection = anchor;
+    if (anchors.length) recorder.trace.selection = anchors;
     const report = () => {
       if (alive()) this.deps.onTrace(topicId, recorder.trace, false);
     };
@@ -321,15 +328,15 @@ export class Tutor {
       const edited = this.nextPrompts.get(topicId);
       this.nextPrompts.delete(topicId);
       const created = edited
-        ? await this.createEdited(model, topic, trimmed, anchor, edited, tools, abort.signal)
-        : await this.createFitted(model, topic, trimmed, anchor, tools, abort.signal, alive);
+        ? await this.createEdited(model, topic, trimmed, anchors, edited, tools, abort.signal)
+        : await this.createFitted(model, topic, trimmed, anchors, tools, abort.signal, alive);
       session = created.session;
       if (!alive()) return;
       recorder.trace.request = {
         initialPrompts: created.initialPrompts.map((message) => ({ ...message, content: capText(message.content) })),
         prompt: capText(created.prompt),
         tools: tools.map((tool) => tool.name),
-        ...(anchor ? { selection: anchor } : {}),
+        ...(anchors.length ? { selection: anchors } : {}),
         ...(edited ? { edited: true } : {}),
       };
       report();
@@ -429,7 +436,7 @@ export class Tutor {
     model: LanguageModelAPI,
     topic: TopicRecord,
     question: string,
-    anchor: SelectionAnchor | null,
+    anchor: SelectionAnchor | readonly SelectionAnchor[] | null,
     initialPrompts: PromptMessage[],
     tools: ToolDeclaration[],
     signal: AbortSignal,
@@ -444,7 +451,7 @@ export class Tutor {
     model: LanguageModelAPI,
     topic: TopicRecord,
     question: string,
-    anchor: SelectionAnchor | null,
+    anchor: SelectionAnchor | readonly SelectionAnchor[] | null,
     tools: ToolDeclaration[],
     signal: AbortSignal,
     alive: () => boolean,

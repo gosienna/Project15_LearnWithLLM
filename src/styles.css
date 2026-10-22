@@ -731,6 +731,44 @@ button { cursor: pointer; }
   box-shadow: var(--shadow);
 }
 
+.ask-modes { display: flex; gap: 4px; }
+
+.ask-mode {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink);
+  padding: 4px 10px;
+  font-size: 0.82rem;
+}
+
+.ask-mode.is-active {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-color: transparent;
+}
+
+.ask-mode:disabled { color: var(--muted); }
+
+.ask-edits {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.ask-edit { display: flex; flex-direction: column; gap: 4px; }
+
+.ask-edit-tag, .ask-edit-note, .ask-extra {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.ask-edit-error { font-size: 0.75rem; color: #8c2f2f; }
+
+.ask-extra { margin: 0; }
+
 .ask-quote {
   margin: 0;
   padding: 4px 8px;

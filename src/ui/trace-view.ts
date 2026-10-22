@@ -1,4 +1,4 @@
-import type { RequestInput, TraceEvent, TurnTrace } from "../types.ts";
+import { selectionList, type RequestInput, type TraceEvent, type TurnTrace } from "../types.ts";
 
 function toolCount(events: TraceEvent[]): number {
   return events.filter((event) => event.kind === "tool").length;
@@ -171,8 +171,13 @@ export function renderTrace(trace: TurnTrace, key: string, openKeys: Set<string>
 }
 
 function quoteOf(trace: TurnTrace): string | null {
-  const selection = trace.selection;
-  if (!selection) return null;
+  const list = selectionList(trace.selection);
+  if (list.length === 0) return null;
+  if (list.length > 1) {
+    const tags = list.slice(0, 8).map((item) => item.tag).join(", ");
+    return `Selected ${list.length} elements · ${tags}`;
+  }
+  const selection = list[0]!;
   const text = selection.quote.exact ? `“${selection.quote.exact.slice(0, 120)}”` : `<${selection.tag}>`;
   return `${selection.kind === "text" ? "Selected" : "Alt+clicked"} ${text} · ${selection.selector}`;
 }

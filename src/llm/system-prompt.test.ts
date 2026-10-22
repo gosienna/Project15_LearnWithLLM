@@ -75,6 +75,30 @@ describe("system prompt", () => {
     expect(prompt).not.toContain(SELECTION_START);
   });
 
+  it("names every element in a box selection and marks each one", () => {
+    const sources = {
+      ...emptyBoard(),
+      html: '<p>Leaves.</p><img src="board-image:img1" alt="leaf">',
+      svg: '<svg width="10" height="10"><rect></rect><text>Sun</text></svg>',
+    };
+    const { prompt } = buildPrompt({
+      sources,
+      materialMarkdown: "",
+      question: "Compare these",
+      anchor: [
+        anchor({ kind: "element", selector: "body > img:nth-of-type(1)", tag: "img", quote: { exact: "", prefix: "", suffix: "" }, outerHTML: '<img src="board-image:img1" alt="leaf">' }),
+        anchor({ component: "svg", selector: "#lesson-svg > svg:nth-of-type(1) > text:nth-of-type(1)", tag: "text", kind: "element" }),
+      ],
+    });
+    expect(prompt).toContain("The learner selected 2 elements.");
+    expect(prompt).toContain("whiteboard_insert places new html after the last one.");
+    expect(prompt).toContain("selector: body > img:nth-of-type(1)");
+    expect(prompt).toContain("selector: #lesson-svg > svg:nth-of-type(1) > text:nth-of-type(1)");
+    expect(prompt).toContain(`${SELECTION_START}<img src="board-image:img1" alt="leaf">${SELECTION_END}`);
+    expect(prompt).toContain(`${SELECTION_START}<text>Sun</text>${SELECTION_END}`);
+    expect(prompt.trim().endsWith("# Question\nCompare these")).toBe(true);
+  });
+
   it("marks an svg element inside the svg source", () => {
     const sources = { ...emptyBoard(), html: "<p>Text</p>", svg: '<svg width="10" height="10"><rect></rect><text>Sun</text></svg>' };
     const { prompt } = buildPrompt({

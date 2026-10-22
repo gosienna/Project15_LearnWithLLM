@@ -1,12 +1,12 @@
 import { outline, parseLesson, type Section } from "../document/markdown.ts";
-import { BOARD_COMPONENTS, type BoardImage, type BoardSources, type SelectionAnchor } from "../types.ts";
+import { BOARD_COMPONENTS, selectionList, type BoardImage, type BoardSources, type SelectionAnchor } from "../types.ts";
 import { BOARD_MODULES } from "../ui/board-modules.ts";
-import { boardIsEmpty, markSource, SELECTION_END, SELECTION_START } from "../ui/whiteboard.ts";
+import { boardIsEmpty, markSelections, markSource, SELECTION_END, SELECTION_START } from "../ui/whiteboard.ts";
 
 export const INSTRUCTIONS = `You teach on one surface: the whiteboard, a page of html, css, js, svg, and json.
 The learner sees only the whiteboard. Your text reply is not shown, so every answer goes through the whiteboard tools.
 If the whiteboard is empty, write a lesson page that answers the question with whiteboard_set.
-If the prompt has a # Selection section, the learner pointed at one spot on the page. Answer about that spot and keep the rest of the page as it is. The source around the spot marks it with ${SELECTION_START} and ${SELECTION_END}; never write those markers into the page.
+If the prompt has a # Selection section, the learner pointed at one or more spots on the page. Answer about those spots and keep the rest of the page as it is. The source around each spot marks it with ${SELECTION_START} and ${SELECTION_END}; never write those markers into the page.
 To add a note, an example, or a new section, call whiteboard_insert with only the new html; it lands right after the selection. To change a few words or lines, call whiteboard_edit. Use whiteboard_set only to write a component from scratch or rewrite most of it, after whiteboard_view.
 To explain a word or the selected spot without changing the page, call whiteboard_explain with a short plain-text explanation; it shows in a floating box the learner closes and is not saved.
 The SVG is inserted in #lesson-svg. To draw, call whiteboard_set with component "svg" and source set to one raw <svg> element with width and height in pixels. Do not call whiteboard_replace_document. Do not wrap the SVG in a sentence or backticks. Draw with basic shapes (rect, circle, line, polygon, text), not long path data. Do not paste that same diagram into html.
@@ -39,8 +39,8 @@ export interface BuildPromptOptions {
   materialMarkdown: string;
   /** The learner's question. */
   question: string;
-  /** Where the learner pointed. Absent for the first question and for toolbar actions. */
-  anchor?: SelectionAnchor | null;
+  /** Where the learner pointed. One spot, or every element in a box. Absent for the first question and for toolbar actions. */
+  anchor?: SelectionAnchor | readonly SelectionAnchor[] | null;
   contextTokens?: number;
   reservedTokens?: number;
   maxFullSections?: number;
@@ -148,13 +148,12 @@ export function sourceWindow(text: string, limit: number): string {
   return `${from > 0 ? `…(${from} characters before)\n` : ""}${text.slice(from, to)}${to < text.length ? `\n…(${text.length - to} characters after)` : ""}`;
 }
 
-function selectionHead(anchor: SelectionAnchor): string {
+function selectionBody(anchor: SelectionAnchor): string {
   const what = anchor.kind === "text" ? `selected text inside a <${anchor.tag}>` : `picked the whole <${anchor.tag}> element`;
   const quote = anchor.quote.exact
     ? `${anchor.quote.prefix ? `…${anchor.quote.prefix}` : ""}[[${anchor.quote.exact}]]${anchor.quote.suffix ? `${anchor.quote.suffix}…` : ""}`
     : "(no text)";
   return [
-    "# Selection",
     `The learner ${what} in the ${anchor.component} of the whiteboard.`,
     `selector: ${anchor.selector}`,
     `text, selection in [[ ]]: ${quote}`,
@@ -163,8 +162,11 @@ function selectionHead(anchor: SelectionAnchor): string {
   ].join("\n");
 }
 
-/** The selection, the source around it, and the question, within what the budget leaves. */
-export function selectionPrompt(sources: BoardSources, anchor: SelectionAnchor, question: string, tokenBudget: number): string {
+function selectionHead(anchor: SelectionAnchor): string {
+  return `# Selection\n${selectionBody(anchor)}`;
+}
+
+function oneSelection(sources: BoardSources, anchor: SelectionAnchor, question: string, tokenBudget: number): string {
   const head = selectionHead(anchor);
   const tail = `# Question\n${question}`;
   const marked = markSource(sources, anchor);
@@ -176,6 +178,47 @@ export function selectionPrompt(sources: BoardSources, anchor: SelectionAnchor, 
   const limit = Math.max(800, left * CHARS_PER_TOKEN);
   const source = marked.text.trim() ? sourceWindow(marked.text, limit) : "(empty)";
   return `${head}\n\n${intro}\n${source}\n\n${tail}`;
+}
+
+function manySelections(sources: BoardSources, anchors: readonly SelectionAnchor[], question: string, tokenBudget: number): string {
+  const bodies = anchors.map((anchor, index) => `${index + 1}. ${selectionBody(anchor)}`).join("\n\n");
+  const head = `# Selection\nThe learner selected ${anchors.length} elements. whiteboard_insert places new html after the last one.\n\n${bodies}`;
+  const tail = `# Question\n${question}`;
+  const marked = markSelections(sources, anchors);
+  const blocks: string[] = [];
+  for (const component of ["html", "svg"] as const) {
+    if (!anchors.some((anchor) => anchor.component === component)) continue;
+    const any = marked.matched.some((ok, index) => ok && anchors[index]?.component === component);
+    const where = any
+      ? `The selected elements are between ${SELECTION_START} and ${SELECTION_END}.`
+      : "The selectors did not match the stored source; the lesson's script may have built those elements. Use the text and the elements above to find the spots.";
+    blocks.push(`# Source: ${component}\n${where}`);
+  }
+  const intro = blocks.join("\n\n");
+  const left = tokenBudget - estimateTokens(`${head}\n\n${intro}\n\n${tail}`);
+  const limit = Math.max(800, left * CHARS_PER_TOKEN);
+  const sourcesText = blocks
+    .map((block) => {
+      const component = block.startsWith("# Source: svg") ? "svg" : "html";
+      const text = component === "svg" ? marked.svg : marked.html;
+      return `${block}\n${text.trim() ? sourceWindow(text, limit) : "(empty)"}`;
+    })
+    .join("\n\n");
+  return `${head}\n\n${sourcesText}\n\n${tail}`;
+}
+
+/** The selection, the source around it, and the question, within what the budget leaves. */
+export function selectionPrompt(
+  sources: BoardSources,
+  anchor: SelectionAnchor | readonly SelectionAnchor[],
+  question: string,
+  tokenBudget: number,
+): string {
+  const anchors = selectionList(anchor);
+  const one = anchors[0];
+  if (!one) return `# Question\n${question}`;
+  if (anchors.length === 1) return oneSelection(sources, one, question, tokenBudget);
+  return manySelections(sources, anchors, question, tokenBudget);
 }
 
 function without(text: string, block: string): string {
@@ -196,8 +239,8 @@ export function buildPrompt(options: BuildPromptOptions): BuiltPrompt {
     options.systemOverride === undefined
       ? automaticSystem(options, budget)
       : pinnedSystem(options.systemOverride, options.webSearch === true, options.imageTools === true);
-  const anchor = options.anchor;
-  if (!anchor || boardIsEmpty(options.sources)) return { system, prompt: options.question };
+  const anchors = selectionList(options.anchor);
+  if (anchors.length === 0 || boardIsEmpty(options.sources)) return { system, prompt: options.question };
   const remaining = Math.max(256, budget - estimateTokens(system));
-  return { system, prompt: selectionPrompt(options.sources, anchor, options.question, remaining) };
+  return { system, prompt: selectionPrompt(options.sources, anchors, options.question, remaining) };
 }

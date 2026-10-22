@@ -13,20 +13,38 @@ const anchor: SelectionAnchor = {
   rect: { x: 40, y: 30, width: 60, height: 16 },
 };
 
+const picture: SelectionAnchor = {
+  kind: "element",
+  component: "svg",
+  selector: "#lesson-svg > svg:nth-of-type(1) > rect:nth-of-type(1)",
+  tag: "rect",
+  quote: { exact: "", prefix: "", suffix: "" },
+  outerHTML: "<rect></rect>",
+  rect: { x: 8, y: 80, width: 20, height: 20 },
+};
+
 function setup() {
   const host = document.createElement("div");
   document.body.append(host);
-  const asked: [string, SelectionAnchor][] = [];
+  const asked: [string, SelectionAnchor[]][] = [];
+  const edited: { component: string; find: string; replace: string }[][] = [];
   let cancelled = 0;
   let stopped = 0;
   const popover = renderAskPopover(host, {
     onAsk: (question, at) => asked.push([question, at]),
+    onEdit: (changes) => edited.push(changes),
     onCancel: () => (cancelled += 1),
     onStop: () => (stopped += 1),
+    editSlices: (anchors) =>
+      anchors.map((item) =>
+        item.kind === "text"
+          ? { component: item.component, find: item.quote.exact }
+          : { component: item.component, find: item.outerHTML },
+      ),
   });
   const panel = host.querySelector<HTMLFormElement>(".ask-popover")!;
   const field = panel.querySelector("textarea")!;
-  return { host, popover, panel, field, asked, cancelled: () => cancelled, stopped: () => stopped };
+  return { host, popover, panel, field, asked, edited, cancelled: () => cancelled, stopped: () => stopped };
 }
 
 describe("ask popover", () => {
@@ -38,7 +56,7 @@ describe("ask popover", () => {
     expect(panel.querySelector(".ask-quote")?.textContent).toBe("chlorophyll");
     field.value = "What is it?";
     field.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
-    expect(asked).toEqual([["What is it?", anchor]]);
+    expect(asked).toEqual([["What is it?", [anchor]]]);
     expect(popover.question()).toBe("What is it?");
     host.remove();
   });
@@ -90,6 +108,35 @@ describe("ask popover", () => {
     field.value = "";
     document.body.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
     expect(panel.hidden).toBe(true);
+    host.remove();
+  });
+
+  it("edits the selected text on Enter or Confirm and keeps both drafts", () => {
+    const { popover, panel, field, asked, edited, host } = setup();
+    popover.show([anchor, picture]);
+    expect(panel.querySelector(".ask-quote")?.textContent).toBe("2 selected: p, rect");
+    panel.querySelectorAll<HTMLButtonElement>(".ask-mode")[1]!.click();
+    const areas = [...panel.querySelectorAll<HTMLTextAreaElement>(".ask-edit textarea")];
+    expect(areas.map((area) => area.value)).toEqual(["chlorophyll", "<rect></rect>"]);
+    expect(panel.querySelector(".ask-edit-tag")?.textContent).toBe("p · HTML");
+    expect(panel.querySelectorAll(".ask-edit-tag")[1]?.textContent).toBe("rect · SVG");
+    areas[0]!.value = "chlorophylls";
+    areas[0]!.dispatchEvent(new Event("input", { bubbles: true }));
+    areas[0]!.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    expect(edited).toEqual([[{ component: "html", find: "chlorophyll", replace: "chlorophylls" }]]);
+    expect(asked).toEqual([]);
+
+    panel.querySelectorAll<HTMLButtonElement>(".ask-mode")[0]!.click();
+    expect(field.value).toBe("");
+    field.value = "What is it?";
+    panel.querySelectorAll<HTMLButtonElement>(".ask-mode")[1]!.click();
+    expect(panel.querySelector<HTMLTextAreaElement>(".ask-edit textarea")?.value).toBe("chlorophylls");
+    panel.querySelector<HTMLButtonElement>(".ask-go")!.click();
+    expect(edited[1]).toEqual([{ component: "html", find: "chlorophyll", replace: "chlorophylls" }]);
+    panel.querySelectorAll<HTMLButtonElement>(".ask-mode")[0]!.click();
+    expect(field.value).toBe("What is it?");
+    field.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    expect(asked).toEqual([["What is it?", [anchor, picture]]]);
     host.remove();
   });
 });

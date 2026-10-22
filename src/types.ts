@@ -79,6 +79,13 @@ export interface SelectionAnchor {
   rect: { x: number; y: number; width: number; height: number };
 }
 
+/** A selection stored as one anchor, or as a list. Older records are a single object. */
+export function selectionList(value: SelectionAnchor | readonly SelectionAnchor[] | null | undefined): SelectionAnchor[] {
+  if (!value) return [];
+  if ("kind" in value) return [value];
+  return [...value];
+}
+
 /** The raw input of one ask. Every ask creates a new session. */
 export interface RequestInput {
   /** The messages the session was created with: the system prompt, or an edited list. */
@@ -86,7 +93,8 @@ export interface RequestInput {
   prompt: string;
   /** The names of the tools the session was created with. Absent in records from before they were kept. */
   tools?: string[];
-  selection?: SelectionAnchor;
+  /** One anchor in records from before box selection, or the list from a later ask. */
+  selection?: SelectionAnchor | SelectionAnchor[];
   /** The initial prompts came from the Debug editor instead of the topic. */
   edited?: boolean;
 }
@@ -96,7 +104,8 @@ export interface TurnTrace {
   modelId: string | null;
   /** The learner's question and where they pointed, for the Trace tab. */
   question?: string;
-  selection?: SelectionAnchor;
+  /** One anchor in records from before box selection, or the list from a later ask. */
+  selection?: SelectionAnchor | SelectionAnchor[];
   startedAt: number;
   endedAt?: number;
   events: TraceEvent[];

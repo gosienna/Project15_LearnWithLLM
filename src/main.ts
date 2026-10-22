@@ -1,11 +1,11 @@
 import { fetchImageAvailable, loadBackendStatus, readSavedModelId, searchAvailable, writeSavedModelId, type BackendStatus, type BackendWindow } from "./llm/backend.ts";
 import { directModelId, readDirectConfig, writeDirectConfig } from "./llm/direct.ts";
-import { toolSpecs } from "./llm/tools.ts";
+import { createWhiteboardTools, toolSpecs } from "./llm/tools.ts";
 import { Tutor } from "./llm/turn.ts";
 import { boardImageSources } from "./storage/board-images.ts";
 import { createEmptyTopic, createRepository, openDatabase, type TopicRepository } from "./storage/db.ts";
 import type { BoardSources, FetchImageFn, SearchFn, SelectionAnchor, TopicRecord, TurnTrace } from "./types.ts";
-import { renderAskPopover, type AskPopover } from "./ui/ask-popover.ts";
+import { renderAskPopover, type AskPopover, type EditChange } from "./ui/ask-popover.ts";
 import { renderExplainPopover, type ExplainPopover } from "./ui/explain-popover.ts";
 import { createProgressView, progressLine, type ProgressView } from "./ui/progress-view.ts";
 import { renderSystemPanel } from "./ui/system.ts";
@@ -18,6 +18,7 @@ import {
   boardDraft,
   boardIsEmpty,
   clearBoardHighlight,
+  editSlice,
   focusStart,
   renderWhiteboard,
   syncStartForm,
@@ -133,7 +134,7 @@ function paint(app: AppController): void {
 function paintBoard(app: AppController, topic: TopicRecord | undefined, sources: BoardSources): void {
   const handlers = {
     onStart: (question: string) => void ask(app, question, null),
-    onSelection: (anchor: SelectionAnchor | null) => onSelection(app, anchor),
+    onSelection: (anchors: SelectionAnchor[] | null) => onSelection(app, anchors),
     onDraft: () => notifyDraft(app),
   };
   const images = topic?.images ?? [];
@@ -158,19 +159,46 @@ function placeProgress(app: AppController): void {
   element.classList.toggle("is-floating", !form);
 }
 
-function onSelection(app: AppController, anchor: SelectionAnchor | null): void {
-  if (anchor) {
-    app.popover.show(anchor);
+function onSelection(app: AppController, anchors: SelectionAnchor[] | null): void {
+  if (anchors?.length) {
+    app.popover.show(anchors);
     return;
   }
-  // A click elsewhere on the board closes an empty panel and keeps a typed question.
-  if (!app.popover.question().trim()) app.popover.hide();
+  // A click elsewhere on the board closes an empty panel and keeps a typed question or edit.
+  if (!app.popover.hasDraft()) app.popover.hide();
 }
 
-async function ask(app: AppController, question: string, anchor: SelectionAnchor | null): Promise<void> {
-  if (anchor) app.popover.setStatus("Starting the model…");
-  await app.tutor.ask(app.activeId, question, { anchor });
-  if (!anchor) return;
+async function applyEdits(app: AppController, changes: EditChange[]): Promise<void> {
+  const topicId = app.activeId;
+  if (!topicId || changes.length === 0 || app.busy) return;
+  app.popover.setEnabled(false);
+  const tools = createWhiteboardTools({
+    topicId,
+    getOpenTopicId: () => app.activeId,
+    repo: app.repo,
+    onDocument: (topic) => {
+      upsert(app, topic);
+      paint(app);
+    },
+  });
+  const edit = tools.find((tool) => tool.name === "whiteboard_edit");
+  try {
+    if (!edit) throw new Error("whiteboard_edit is not available.");
+    for (const change of changes) await edit.execute(change);
+  } catch (error) {
+    app.popover.setEnabled(true);
+    app.popover.setStatus(error instanceof Error ? error.message : String(error));
+    return;
+  }
+  app.popover.setEnabled(true);
+  app.popover.hide();
+  clearBoardHighlight(app.shell.board);
+}
+
+async function ask(app: AppController, question: string, anchors: SelectionAnchor[] | null): Promise<void> {
+  if (anchors?.length) app.popover.setStatus("Starting the model…");
+  await app.tutor.ask(app.activeId, question, { anchor: anchors });
+  if (!anchors?.length) return;
   if (app.error) {
     app.popover.setStatus(app.error);
     return;
@@ -184,8 +212,11 @@ function promptInputs(app: AppController, topic: TopicRecord): PromptInputs {
     topicId: topic.id,
     system: () => app.tutor.previewSystem(topic),
     request: () => ({ ...app.tutor.previewRequest(topic), tools: toolSpecs(activeSearch(app) !== null, activeFetchImage(app) !== null) }),
-    prompt: () => app.tutor.previewPrompt(topic, pendingQuestion(app), app.popover.anchor()),
-    selection: () => app.popover.anchor(),
+    prompt: () => app.tutor.previewPrompt(topic, pendingQuestion(app), app.popover.anchors()),
+    selection: () => {
+      const list = app.popover.anchors();
+      return list.length ? list : null;
+    },
     subscribePrompt: (listener) => {
       app.draftListeners.add(listener);
       return () => app.draftListeners.delete(listener);
@@ -300,10 +331,22 @@ export async function boot(root: HTMLElement): Promise<void> {
   const shell = renderShell(root);
   let app: AppController;
   const popover = renderAskPopover(shell.boardArea, {
-    onAsk: (question, anchor) => void ask(app, question, anchor),
+    onAsk: (question, anchors) => void ask(app, question, anchors),
+    onEdit: (changes) => void applyEdits(app, changes),
     onCancel: () => clearBoardHighlight(shell.board),
     onStop: () => app.tutor.stop(),
     onInput: () => notifyDraft(app),
+    editSlices: (anchors) => {
+      const topic = app.topics.find((item) => item.id === app.activeId);
+      const sources = {
+        html: topic?.html ?? "",
+        css: topic?.css ?? "",
+        js: topic?.js ?? "",
+        svg: topic?.svg ?? "",
+        json: topic?.json ?? "",
+      };
+      return anchors.map((anchor) => editSlice(sources, anchor));
+    },
   });
   const explain = renderExplainPopover(shell.boardArea);
   shell.storeMaterial.addEventListener("click", () => {

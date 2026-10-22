@@ -128,7 +128,7 @@ export function renderRequestEditor(
     /** The prompt the next ask sends: the selection and its source, then the question. */
     prompt?: () => string;
     /** Where the learner pointed for the next ask, if anywhere. */
-    selection?: () => SelectionAnchor | null;
+    selection?: () => SelectionAnchor | readonly SelectionAnchor[] | null;
     subscribePrompt?: (listener: () => void) => () => void;
   },
 ): void {

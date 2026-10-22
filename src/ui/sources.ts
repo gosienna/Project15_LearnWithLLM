@@ -53,7 +53,7 @@ export interface PromptInputs {
   onSetRequest: (prompts: PromptMessage[] | null) => void;
   /** The prompt the next ask sends, built from the open question and selection. */
   prompt?: () => string;
-  selection?: () => SelectionAnchor | null;
+  selection?: () => SelectionAnchor | readonly SelectionAnchor[] | null;
   subscribePrompt?: (listener: () => void) => () => void;
   /** This visit's asks, newest first, and the id of the one running. */
   traces?: () => TurnTrace[];
