@@ -1,4 +1,4 @@
-import { WHITEBOARD_TOOL_SPECS } from "../llm/tools.ts";
+import { WHITEBOARD_TOOL_SPECS, type ModelToolInput } from "../llm/tools.ts";
 import type { PromptMessage, SelectionAnchor } from "../types.ts";
 import { createJsonTreeState, renderJsonTree, type JsonTreeState } from "./json-tree.ts";
 
@@ -10,6 +10,8 @@ export interface SystemPromptState {
 export interface RequestPreview {
   edited: boolean;
   initialPrompts: PromptMessage[];
+  /** The tools the ask offers; the whiteboard tools when absent. */
+  tools?: ModelToolInput[];
 }
 
 export interface EditorHandlers {
@@ -179,7 +181,7 @@ export function renderRequestEditor(
       initialPrompts: rows,
       prompt: promptText(),
       ...(selection ? { selection } : {}),
-      tools: WHITEBOARD_TOOL_SPECS,
+      tools: preview.tools ?? WHITEBOARD_TOOL_SPECS,
     };
   };
 

@@ -3,14 +3,20 @@ import { BOARD_COMPONENTS, type BoardSources, type SelectionAnchor } from "../ty
 import { boardIsEmpty, markSource, SELECTION_END, SELECTION_START } from "../ui/whiteboard.ts";
 
 export const INSTRUCTIONS = `You teach on one surface: the whiteboard, a page of html, css, js, svg, and json.
-The learner sees only the whiteboard. Your text reply is not shown, so every answer goes onto the page through the whiteboard tools.
+The learner sees only the whiteboard. Your text reply is not shown, so every answer goes through the whiteboard tools.
 If the whiteboard is empty, write a lesson page that answers the question with whiteboard_set.
-If the prompt has a # Selection section, the learner pointed at one spot on the page. Answer about that spot: add a short note right next to it, or correct or expand that spot. Keep the rest of the page as it is. The source around the spot marks it with ${SELECTION_START} and ${SELECTION_END}; never write those markers into the page.
-Before editing a component, call whiteboard_view, then send the whole changed component with whiteboard_set.
+If the prompt has a # Selection section, the learner pointed at one spot on the page. Answer about that spot and keep the rest of the page as it is. The source around the spot marks it with ${SELECTION_START} and ${SELECTION_END}; never write those markers into the page.
+To add a note, an example, or a new section, call whiteboard_insert with only the new html; it lands right after the selection. To change a few words or lines, call whiteboard_edit. Use whiteboard_set only to write a component from scratch or rewrite most of it, after whiteboard_view.
+To explain a word or the selected spot without changing the page, call whiteboard_explain with a short plain-text explanation; it shows in a floating box the learner closes and is not saved.
 The SVG is inserted in #lesson-svg. To draw, call whiteboard_set with component "svg" and source set to one raw <svg> element with width and height in pixels. Do not call whiteboard_replace_document. Do not wrap the SVG in a sentence or backticks. Draw with basic shapes (rect, circle, line, polygon, text), not long path data. Do not paste that same diagram into html.
 Parsed JSON is lessonData inside the page, or null when json is empty. Put labels, steps, and numbers there when the script should stay stable.
 Call whiteboard_snapshot to read what the page currently says.
 A stored markdown document exists only after the learner stores the learning material. It is not the live page. Call whiteboard_store_material only when the learner asks to store it.`;
+
+/** Added to the instructions when the ask offers web_search. */
+export const WEB_SEARCH_INSTRUCTIONS = `# Web search
+Call web_search when the question needs current facts, numbers, or names you are not sure of. Search before you write, then teach from what the results say.
+When you use results, end the lesson with a Sources list of <a href="url" target="_blank" rel="noopener">title</a> links. Never invent a url.`;
 
 export const EMPTY_BOARD_LINE = "The whiteboard is empty.";
 
@@ -32,6 +38,8 @@ export interface BuildPromptOptions {
   maxFullSections?: number;
   /** A system prompt pinned to the topic; replaces the instructions, board status, and material. */
   systemOverride?: string;
+  /** The ask offers web_search. */
+  webSearch?: boolean;
 }
 
 export interface BuiltPrompt {
@@ -45,8 +53,8 @@ export function boardStatus(sources: BoardSources): string {
   return BOARD_COMPONENTS.map((key) => `${key}: ${sources[key].length} characters`).join(", ") + ".";
 }
 
-export function whiteboardPreface(status: string, includeMaterial: boolean): string {
-  let text = `${INSTRUCTIONS}\n\n# Whiteboard\n${status}\n`;
+export function whiteboardPreface(status: string, includeMaterial: boolean, webSearch = false): string {
+  let text = `${INSTRUCTIONS}\n\n${webSearch ? `${WEB_SEARCH_INSTRUCTIONS}\n\n` : ""}# Whiteboard\n${status}\n`;
   if (includeMaterial) text += `\n# Stored learning material\n`;
   return text;
 }
@@ -101,7 +109,7 @@ export function fitLesson(markdown: string, tokenBudget: number, maxFullSections
 
 function automaticSystem(options: BuildPromptOptions, budget: number): string {
   const materialMarkdown = options.materialMarkdown.trim();
-  const header = whiteboardPreface(boardStatus(options.sources), materialMarkdown.length > 0);
+  const header = whiteboardPreface(boardStatus(options.sources), materialMarkdown.length > 0, options.webSearch === true);
   const lessonBudget = Math.max(64, budget - estimateTokens(header));
   const material = materialMarkdown ? fitLesson(options.materialMarkdown, lessonBudget, options.maxFullSections) : "";
   return `${header}${material}`;

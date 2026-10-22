@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { serializeLesson } from "../document/markdown.ts";
 import type { SelectionAnchor } from "../types.ts";
 import { emptyBoard, SELECTION_END, SELECTION_START } from "../ui/whiteboard.ts";
-import { buildPrompt, estimateTokens, INSTRUCTIONS, sourceWindow, whiteboardPreface } from "./system-prompt.ts";
+import { buildPrompt, estimateTokens, INSTRUCTIONS, sourceWindow, WEB_SEARCH_INSTRUCTIONS, whiteboardPreface } from "./system-prompt.ts";
 
 function anchor(overrides: Partial<SelectionAnchor> = {}): SelectionAnchor {
   return {
@@ -117,5 +117,12 @@ describe("system prompt", () => {
     });
     expect(system).toBe("You are a pirate tutor.");
     expect(prompt).toContain(SELECTION_START);
+  });
+});
+
+describe("web search instructions", () => {
+  it("come right after the instructions only when the ask offers web_search", () => {
+    expect(whiteboardPreface("The whiteboard is empty.", false, true)).toContain(`${INSTRUCTIONS}\n\n${WEB_SEARCH_INSTRUCTIONS}\n\n# Whiteboard`);
+    expect(whiteboardPreface("The whiteboard is empty.", false)).not.toContain("# Web search");
   });
 });

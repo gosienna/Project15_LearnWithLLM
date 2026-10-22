@@ -35,6 +35,7 @@ Facts from that contract that shape this app:
 | Local models that lack native tool calling use prompted tool calling. Small models often skip tools or call them badly. | Keep the tool list short and the descriptions imperative. If the board is still empty and the reply is a long HTML fragment, move that reply into the html source. |
 | Text only. `responseConstraint` is not available. Iframes do not get the API. | The lesson page is a sandboxed iframe. The app itself stays a top-level page so it can call the API. The iframe does not. |
 | The user picks the model. The page cannot. | Read `localLLM.info()` for the status line only. |
+| `localLLM.search(query, { maxResults })` (newer extensions) searches the web: Tavily with the user's key, or a Google results page in a minimized window when Tavily is missing or out of credits. It rejects with `NotAllowedError` unless the user ticked **Allow web search** for the site, and allows 10 searches per minute per site. | A **Web search** toolbar switch (off by default, kept in localStorage) adds a page-side `web_search` tool that calls `localLLM.search` and returns numbered results with short snippets, plus a `# Web search` section in the system prompt asking for a Sources list of links. The switch is disabled when the extension has no `search`. The lesson iframe allows popups so Sources links open in a new tab. |
 
 Sampling: if the app sets `temperature` it also sets `topK`. Prefer `LanguageModel.params()` defaults so the user's model settings win.
 
@@ -61,7 +62,7 @@ A learner can:
 - A server-side model fallback. If `LanguageModel` is missing or `availability()` is `"unavailable"`, the composer stays disabled.
 - Learner accounts, sync, or export.
 - The learner editing the lesson by typing on the board.
-- Images, audio, quizzes as a separate widget, web search, or browser-control tools. The extension playground's tools are not available to websites, and this app does not try to call them.
+- Images, audio, quizzes as a separate widget, or browser-control tools. The extension playground's tools are not available to websites, and this app does not try to call them. Web search is the exception, through `localLLM.search` (see above).
 - Multiple whiteboard documents inside one topic.
 
 ## Layout

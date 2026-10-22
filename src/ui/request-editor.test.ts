@@ -104,6 +104,9 @@ describe("prompt editors", () => {
     expect(json().tools.map((tool) => tool.name)).toEqual([
       "whiteboard_view",
       "whiteboard_set",
+      "whiteboard_insert",
+      "whiteboard_edit",
+      "whiteboard_explain",
       "whiteboard_snapshot",
       "whiteboard_store_material",
     ]);

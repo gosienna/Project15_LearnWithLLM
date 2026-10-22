@@ -1,11 +1,15 @@
-import { loadBackendStatus, readSavedModelId, writeSavedModelId, type BackendStatus } from "./llm/backend.ts";
+import { loadBackendStatus, readSavedModelId, searchAvailable, writeSavedModelId, type BackendStatus, type BackendWindow } from "./llm/backend.ts";
+import { toolSpecs } from "./llm/tools.ts";
 import { Tutor } from "./llm/turn.ts";
 import { createEmptyTopic, createRepository, openDatabase, type TopicRepository } from "./storage/db.ts";
-import type { SelectionAnchor, TopicRecord, TurnTrace } from "./types.ts";
+import type { SearchFn, SelectionAnchor, TopicRecord, TurnTrace } from "./types.ts";
 import { renderAskPopover, type AskPopover } from "./ui/ask-popover.ts";
+import { renderExplainPopover, type ExplainPopover } from "./ui/explain-popover.ts";
+import { createProgressView, progressLine, type ProgressView } from "./ui/progress-view.ts";
 import { renderSystemPanel } from "./ui/system.ts";
 import { readMode, writeMode, type UiMode } from "./ui/mode.ts";
 import { applyMode, renderShell, setTopicsOpen, type Shell } from "./ui/shell.ts";
+import { readWebSearch, writeWebSearch } from "./ui/web-search.ts";
 import { renderSources, type PromptInputs } from "./ui/sources.ts";
 import { renderTopics } from "./ui/topics.ts";
 import {
@@ -22,6 +26,9 @@ interface AppController {
   repo: TopicRepository;
   shell: Shell;
   popover: AskPopover;
+  /** The model's floating explanation from the last ask. Cleared when the next ask starts. */
+  explain: ExplainPopover;
+  progress: ProgressView;
   topics: TopicRecord[];
   activeId: string;
   error: string | null;
@@ -29,6 +36,8 @@ interface AppController {
   status: BackendStatus;
   tutor: Tutor;
   mode: UiMode;
+  /** The learner's Web search switch. */
+  webSearch: boolean;
   /** This visit's asks on the open topic, newest first. Never saved. */
   traces: TurnTrace[];
   liveTraceId: string | null;
@@ -43,12 +52,25 @@ function activeTopic(app: AppController): TopicRecord | undefined {
 export const STORE_MATERIAL_PROMPT =
   "Store the current whiteboard as the learning material. Write a markdown document of what the page teaches and call whiteboard_store_material. Do not change the html, css, js, svg, or json.";
 
+/** localLLM.search, when the switch is on and the extension offers it. */
+function activeSearch(app: AppController): SearchFn | null {
+  const win = window as unknown as BackendWindow;
+  if (!app.webSearch || !searchAvailable(win)) return null;
+  return (query, maxResults) => win.localLLM!.search!(query, { maxResults });
+}
+
 function syncControls(app: AppController): void {
   const topic = activeTopic(app);
   const empty = !topic || boardIsEmpty(topic);
   const ready = app.status.composerEnabled;
   app.shell.storeMaterial.disabled = app.busy || empty || !ready;
   app.shell.stop.hidden = !app.busy;
+  const canSearch = searchAvailable(window as unknown as BackendWindow);
+  app.shell.webSearch.disabled = !canSearch;
+  app.shell.webSearch.setAttribute("aria-pressed", app.webSearch && canSearch ? "true" : "false");
+  app.shell.webSearch.title = canSearch
+    ? "Let the model search the web. The extension must also allow web search for this site (options → Sites)."
+    : "This extension has no web search. Update it, then reload this page.";
   app.shell.modelName.textContent = app.status.header;
   app.shell.modelStatus.textContent = app.status.detail;
   app.shell.error.hidden = !app.error;
@@ -92,7 +114,17 @@ function paint(app: AppController): void {
     app.mode,
     topic ? promptInputs(app, topic) : undefined,
   );
+  placeProgress(app);
   syncControls(app);
+}
+
+/** Under the start form while the first lesson is written; otherwise floating over the board. */
+function placeProgress(app: AppController): void {
+  const form = app.shell.board.querySelector(".board-start");
+  const target = form ?? app.shell.boardArea;
+  const element = app.progress.element;
+  if (element.parentElement !== target) target.append(element);
+  element.classList.toggle("is-floating", !form);
 }
 
 function onSelection(app: AppController, anchor: SelectionAnchor | null): void {
@@ -105,7 +137,7 @@ function onSelection(app: AppController, anchor: SelectionAnchor | null): void {
 }
 
 async function ask(app: AppController, question: string, anchor: SelectionAnchor | null): Promise<void> {
-  if (anchor) app.popover.setStatus("Updating the board…");
+  if (anchor) app.popover.setStatus("Starting the model…");
   await app.tutor.ask(app.activeId, question, { anchor });
   if (!anchor) return;
   if (app.error) {
@@ -120,7 +152,7 @@ function promptInputs(app: AppController, topic: TopicRecord): PromptInputs {
   return {
     topicId: topic.id,
     system: () => app.tutor.previewSystem(topic),
-    request: () => app.tutor.previewRequest(topic),
+    request: () => ({ ...app.tutor.previewRequest(topic), tools: toolSpecs(activeSearch(app) !== null) }),
     prompt: () => app.tutor.previewPrompt(topic, pendingQuestion(app), app.popover.anchor()),
     selection: () => app.popover.anchor(),
     subscribePrompt: (listener) => {
@@ -171,7 +203,9 @@ function leaveTopic(app: AppController): void {
   app.busy = false;
   app.traces = [];
   app.liveTraceId = null;
+  app.progress.update(null);
   app.popover.hide();
+  app.explain.hide();
 }
 
 async function createTopic(app: AppController): Promise<void> {
@@ -222,6 +256,10 @@ async function deleteTopic(app: AppController, id: string): Promise<void> {
   paint(app);
 }
 
+/** The extension closes its connection after 25s idle and fires `localllm:closed`; the next call reopens it. */
+export const SERVICE_CLOSED = "Model service closed after being idle. Your next ask restarts it.";
+export const SERVICE_UNRESPONSIVE = "The model service stopped answering. Reload the page.";
+
 async function refreshStatus(app: AppController): Promise<void> {
   app.status = await loadBackendStatus(window, readSavedModelId());
   syncControls(app);
@@ -233,8 +271,10 @@ export async function boot(root: HTMLElement): Promise<void> {
   const popover = renderAskPopover(shell.boardArea, {
     onAsk: (question, anchor) => void ask(app, question, anchor),
     onCancel: () => clearBoardHighlight(shell.board),
+    onStop: () => app.tutor.stop(),
     onInput: () => notifyDraft(app),
   });
+  const explain = renderExplainPopover(shell.boardArea);
   shell.storeMaterial.addEventListener("click", () => {
     void app.tutor.ask(app.activeId, STORE_MATERIAL_PROMPT, { note: false });
   });
@@ -262,6 +302,8 @@ export async function boot(root: HTMLElement): Promise<void> {
     repo,
     shell,
     popover,
+    explain,
+    progress: createProgressView(),
     topics,
     activeId: active.id,
     error: null,
@@ -277,11 +319,18 @@ export async function boot(root: HTMLElement): Promise<void> {
     },
     tutor: undefined as unknown as Tutor,
     mode: readMode(),
+    webSearch: readWebSearch(),
     traces: [],
     liveTraceId: null,
     draftListeners: new Set(),
   };
   applyMode(shell, app.mode);
+  shell.webSearch.addEventListener("click", () => {
+    app.webSearch = !app.webSearch;
+    writeWebSearch(app.webSearch);
+    syncControls(app);
+    paint(app);
+  });
   shell.modeButtons.clean.addEventListener("click", () => setMode(app, "clean"));
   shell.modeButtons.debug.addEventListener("click", () => setMode(app, "debug"));
   window.addEventListener("keydown", (event) => {
@@ -295,6 +344,7 @@ export async function boot(root: HTMLElement): Promise<void> {
     repo,
     languageModel: () => app.status.model,
     modelId: () => app.status.chosen?.id ?? null,
+    search: () => activeSearch(app),
     contextTokens: () => app.status.chosen?.inputQuota,
     getOpenTopicId: () => app.activeId,
     onTopic: (topic) => {
@@ -305,18 +355,32 @@ export async function boot(root: HTMLElement): Promise<void> {
       if (topicId !== app.activeId) return;
       if (!app.traces.includes(trace)) app.traces.unshift(trace);
       app.liveTraceId = done ? null : trace.id ?? null;
+      app.progress.update(done ? null : trace);
+      if (!done && trace.selection && app.popover.isOpen()) app.popover.setStatus(progressLine(trace));
       if (app.mode === "debug") paint(app);
     },
     onError: (message) => {
       app.error = message;
       syncControls(app);
     },
+    onExplain: (topicId, { text, anchor }) => {
+      if (topicId === app.activeId) app.explain.show(text, anchor);
+    },
     onBusy: (busy) => {
+      // A new ask starts: the last answer's explanation goes away.
+      if (busy) app.explain.hide();
       app.busy = busy;
       syncControls(app);
+      if (busy && app.status.detail === SERVICE_CLOSED) void refreshStatus(app);
     },
     onDownload: (ratio) => {
       if (ratio === null) return;
+      // Chrome reports 0 and 1 even for a model already on disk; only a real download is shown.
+      if (ratio >= 1) {
+        void refreshStatus(app);
+        return;
+      }
+      if (ratio <= 0) return;
       app.status = { ...app.status, detail: `Downloading ${Math.round(ratio * 100)}%` };
       syncControls(app);
     },
@@ -326,6 +390,11 @@ export async function boot(root: HTMLElement): Promise<void> {
   focusStart(shell.board);
   await refreshStatus(app);
   window.addEventListener("focus", () => void refreshStatus(app));
+  window.addEventListener("localllm:closed", (event) => {
+    const reason = (event as CustomEvent<{ reason?: string }>).detail?.reason;
+    app.status = { ...app.status, detail: reason === "unresponsive" ? SERVICE_UNRESPONSIVE : SERVICE_CLOSED };
+    syncControls(app);
+  });
 }
 
 const root = document.querySelector<HTMLElement>("#app");

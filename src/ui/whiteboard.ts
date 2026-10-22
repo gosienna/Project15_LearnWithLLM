@@ -283,33 +283,50 @@ function noteMarkup(question: string, reply: string, about: string): string {
   return `<aside class="learner-note" data-about="${escapeHtml(about)}" style="${NOTE_STYLE}"><p style="margin:0 0 4px;font-weight:600;">${escapeHtml(question)}</p>${body}</aside>`;
 }
 
+/** Removes selection markers the model copied from the source it read. */
+export function stripSelectionMarkers(text: string): string {
+  return text.replaceAll(SELECTION_START, "").replaceAll(SELECTION_END, "");
+}
+
+export interface InsertedHtml {
+  html: string;
+  /** Where the markup went: after the selected block, under the drawing, or at the end of the page. */
+  placed: "after selection" | "under the drawing" | "at the end";
+}
+
 /**
- * The html with a note answering the learner, placed after the block they pointed at. A selection
- * in the svg puts the note right under the drawing; no selection, or one not in the source, puts it at the end.
+ * The html with `markup` placed after the block the learner pointed at. A selection in the svg puts
+ * it right under the drawing; no selection, or one not in the source, puts it at the end.
  */
+export function insertHtml(sources: BoardSources, anchor: SelectionAnchor | null, markup: string): InsertedHtml {
+  const board = parseBoard(sources);
+  if (!board) return { html: sources.html.trim() ? `${sources.html}\n${markup}` : markup, placed: "at the end" };
+  const holder = board.doc.createElement("div");
+  holder.innerHTML = markup;
+  const nodes = [...holder.childNodes];
+  const target = anchor ? findTarget(board, anchor.selector) : null;
+  let placed: InsertedHtml["placed"] = "at the end";
+  if (target && board.slot?.contains(target)) {
+    board.slot.after(...nodes);
+    placed = "under the drawing";
+  } else if (target) {
+    const block = target.closest(NOTE_HOST) ?? target;
+    if (block.localName === "li") block.append(...nodes);
+    else block.after(...nodes);
+    placed = "after selection";
+  } else {
+    board.doc.body.append(...nodes);
+  }
+  return { html: serialize(board, "html"), placed };
+}
+
+/** The html with a note answering the learner, placed like `insertHtml`. */
 export function insertNote(
   sources: BoardSources,
   anchor: SelectionAnchor | null,
   note: { question: string; reply: string },
 ): string {
-  const markup = noteMarkup(note.question, note.reply, anchor?.quote.exact.slice(0, 80) ?? "");
-  const board = parseBoard(sources);
-  if (!board) return sources.html.trim() ? `${sources.html}\n${markup}` : markup;
-  const holder = board.doc.createElement("div");
-  holder.innerHTML = markup;
-  const aside = holder.firstElementChild!;
-  const target = anchor ? findTarget(board, anchor.selector) : null;
-  if (target && board.slot?.contains(target)) {
-    board.slot.after(aside);
-  } else if (target) {
-    const block = target.closest(NOTE_HOST) ?? target;
-    if (block === board.slot) block.after(aside);
-    else if (block.localName === "li") block.append(aside);
-    else block.after(aside);
-  } else {
-    board.doc.body.append(aside);
-  }
-  return serialize(board, "html");
+  return insertHtml(sources, anchor, noteMarkup(note.question, note.reply, anchor?.quote.exact.slice(0, 80) ?? "")).html;
 }
 
 export interface BoardHandlers {
@@ -457,7 +474,8 @@ export function renderWhiteboard(host: HTMLElement, sources: BoardSources, handl
   const frame = document.createElement("iframe");
   frame.className = "board-frame";
   frame.title = "Whiteboard";
-  frame.setAttribute("sandbox", "allow-scripts");
+  // Popups let Sources links open in a new tab; the frame still gets no same-origin access.
+  frame.setAttribute("sandbox", "allow-scripts allow-popups allow-popups-to-escape-sandbox");
   frame.referrerPolicy = "no-referrer";
   frame.srcdoc = assembleBoardDocument(sources);
   host.append(frame);

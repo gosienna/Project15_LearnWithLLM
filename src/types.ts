@@ -180,8 +180,28 @@ export interface ModelInfo {
   legacy?: boolean;
 }
 
+export interface SearchResult {
+  title: string;
+  url: string;
+  snippet: string;
+  score: number | null;
+}
+
+/** localLLM.search(): Tavily, or a Google results page when Tavily is not usable. */
+export interface SearchResponse {
+  query: string;
+  provider: "tavily" | "google";
+  results: SearchResult[];
+  /** Why the Google fallback was used. */
+  note?: string;
+}
+
+export type SearchFn = (query: string, maxResults: number) => Promise<SearchResponse>;
+
 export interface LocalLlmNamespace {
   info(): Promise<LocalLlmInfo>;
   models?: () => Promise<ModelInfo[]>;
   version?: string;
+  /** Web search, when the learner allowed it for this site in the extension. Newer extensions only. */
+  search?: (query: string, options?: { maxResults?: number }) => Promise<SearchResponse>;
 }

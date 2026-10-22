@@ -6,6 +6,8 @@ export interface Shell {
   topicsToggle: HTMLButtonElement;
   systemButton: HTMLButtonElement;
   storeMaterial: HTMLButtonElement;
+  /** Offer web_search to the model; aria-pressed holds the state. */
+  webSearch: HTMLButtonElement;
   modeButtons: Record<UiMode, HTMLButtonElement>;
   stop: HTMLButtonElement;
   modelName: HTMLElement;
@@ -57,6 +59,12 @@ export function renderShell(root: HTMLElement): Shell {
   storeMaterial.textContent = "Store learning material";
   storeMaterial.disabled = true;
 
+  const webSearch = document.createElement("button");
+  webSearch.type = "button";
+  webSearch.className = "web-search-toggle";
+  webSearch.textContent = "Web search";
+  webSearch.setAttribute("aria-pressed", "false");
+
   const modeSwitch = document.createElement("div");
   modeSwitch.className = "mode-switch";
   modeSwitch.setAttribute("role", "group");
@@ -85,7 +93,7 @@ export function renderShell(root: HTMLElement): Shell {
 
   const toolbarEnd = document.createElement("div");
   toolbarEnd.className = "toolbar-end";
-  toolbarEnd.append(stop, modeSwitch, storeMaterial);
+  toolbarEnd.append(stop, webSearch, modeSwitch, storeMaterial);
   toolbar.append(toolbarStart, toolbarEnd);
 
   const boardTabs = document.createElement("div");
@@ -125,6 +133,7 @@ export function renderShell(root: HTMLElement): Shell {
     topicsToggle,
     systemButton,
     storeMaterial,
+    webSearch,
     modeButtons,
     stop,
     modelName,

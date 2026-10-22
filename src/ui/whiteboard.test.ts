@@ -43,7 +43,7 @@ describe("whiteboard frame", () => {
     };
     renderWhiteboard(host, sources);
     const frame = host.querySelector("iframe");
-    expect(frame?.getAttribute("sandbox")).toBe("allow-scripts");
+    expect(frame?.getAttribute("sandbox")).toBe("allow-scripts allow-popups allow-popups-to-escape-sandbox");
     expect(frame?.getAttribute("sandbox")).not.toContain("allow-same-origin");
     const srcdoc = frame?.srcdoc ?? "";
     expect(srcdoc).toContain(sources.html);

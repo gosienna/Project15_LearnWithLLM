@@ -41,6 +41,11 @@ export interface BackendWindow {
   removeEventListener(type: string, listener: () => void): void;
 }
 
+/** The extension offers localLLM.search(). Whether this site may use it is only known when it runs. */
+export function searchAvailable(win: Pick<BackendWindow, "localLLM">): boolean {
+  return typeof win.localLLM?.search === "function";
+}
+
 export function waitForLanguageModel(win: BackendWindow, timeout = 500): Promise<LanguageModelAPI | null> {
   if (win.LanguageModel) return Promise.resolve(win.LanguageModel);
   return new Promise((resolve) => {

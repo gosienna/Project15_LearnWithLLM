@@ -5,15 +5,22 @@ import type {
   LanguageModelAPI,
   LanguageModelSession,
   PromptMessage,
+  SearchFn,
   SelectionAnchor,
   ToolDeclaration,
   TopicRecord,
   TurnTrace,
 } from "../types.ts";
-import { boardIsEmpty, insertNote, titleFromHtml } from "../ui/whiteboard.ts";
+import { boardIsEmpty, insertNote, stripSelectionMarkers, titleFromHtml } from "../ui/whiteboard.ts";
 import { buildPrompt, estimateTokens, type BuiltPrompt } from "./system-prompt.ts";
 import { createWhiteboardTools } from "./tools.ts";
 import { capText, TraceRecorder } from "./trace.ts";
+
+/** How long creating a session may take before the ask gives up. A local model loads well within it. */
+export const START_TIMEOUT_MS = 45_000;
+
+export const START_TIMEOUT =
+  "The model service did not answer. Reload the page to reconnect.";
 
 /** Shown when a turn ends and the board did not change. */
 export const NOTHING_CHANGED = "The model did not change the whiteboard. Ask again, or try a different model.";
@@ -72,8 +79,12 @@ export interface TutorDeps {
   onError: (message: string | null) => void;
   onBusy: (busy: boolean) => void;
   onDownload: (ratio: number | null) => void;
+  /** whiteboard_explain ran: show the text next to where the learner pointed. Never saved. */
+  onExplain?: (topicId: string, explanation: { text: string; anchor: SelectionAnchor | null }) => void;
   contextTokens?: () => number | undefined;
   modelId?: () => string | null;
+  /** The search function when web search is on and the extension offers it; otherwise null. */
+  search?: () => SearchFn | null;
 }
 
 export interface AskOptions {
@@ -98,6 +109,59 @@ async function* iterateText(source: AsyncIterable<string> | ReadableStream<strin
   } finally {
     reader.releaseLock();
   }
+}
+
+/** Ends with an AbortError as soon as the signal fires, even when the backend never yields again. */
+async function* untilAborted<T>(source: AsyncGenerator<T>, signal: AbortSignal): AsyncGenerator<T> {
+  const aborted = new Promise<never>((_, reject) => {
+    const fail = () => reject(Object.assign(new Error("Aborted"), { name: "AbortError" }));
+    if (signal.aborted) fail();
+    else signal.addEventListener("abort", fail, { once: true });
+  });
+  aborted.catch(() => {});
+  try {
+    for (;;) {
+      const step = await Promise.race([source.next(), aborted]);
+      if (step.done) return;
+      yield step.value;
+    }
+  } finally {
+    void source.return(undefined).catch(() => {});
+  }
+}
+
+/** The promise, or AbortError when the signal fires first, or TimeoutError after `ms`. */
+export function settleWithin<T>(promise: Promise<T>, signal: AbortSignal, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => finish(() => reject(Object.assign(new Error(message), { name: "TimeoutError" }))), ms);
+    const onAbort = () => finish(() => reject(Object.assign(new Error("Aborted"), { name: "AbortError" })));
+    const finish = (settle: () => void) => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      settle();
+    };
+    if (signal.aborted) return onAbort();
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => finish(() => resolve(value)),
+      (error: unknown) => finish(() => reject(error)),
+    );
+  });
+}
+
+/** A session that arrives after the ask gave up on it is destroyed, so it does not hold a slot. */
+function createSession(model: LanguageModelAPI, options: CreateOptions, signal: AbortSignal): Promise<LanguageModelSession> {
+  const pending = model.create(options);
+  return settleWithin(pending, signal, START_TIMEOUT_MS, START_TIMEOUT).catch((error: unknown) => {
+    pending.then((late) => late.destroy(), () => {});
+    throw error;
+  });
+}
+
+/** A reply printed as a fenced block: the code inside the fence. */
+export function unfence(reply: string): string {
+  const match = /^\s*```[\w-]*\s*\n([\s\S]*?)\n?```\s*$/.exec(reply);
+  return match ? match[1]! : reply;
 }
 
 function sourcesOf(topic: TopicRecord) {
@@ -129,6 +193,7 @@ export class Tutor {
 
   private build(topic: TopicRecord, question: string, anchor: SelectionAnchor | null, maxFullSections?: number): BuiltPrompt {
     return buildPrompt({
+      webSearch: !!this.deps.search?.(),
       sources: sourcesOf(topic),
       materialMarkdown: topic.materialMarkdown,
       question,
@@ -196,6 +261,7 @@ export class Tutor {
     const boardWasEmpty = boardIsEmpty(topic);
     const svgAtStart = topic.svg;
     let toolSucceeded = false;
+    let explained = false;
     const recorder = new TraceRecorder(this.deps.modelId?.() ?? null);
     recorder.trace.id = crypto.randomUUID();
     recorder.trace.question = trimmed;
@@ -203,13 +269,19 @@ export class Tutor {
     const report = () => {
       if (alive()) this.deps.onTrace(topicId, recorder.trace, false);
     };
+    report();
     const tools = createWhiteboardTools({
       topicId,
       getOpenTopicId: this.deps.getOpenTopicId,
       repo: this.deps.repo,
+      anchor,
       onDocument: (saved) => {
         toolSucceeded = true;
         if (alive()) this.deps.onTopic(saved);
+      },
+      onExplain: (text) => {
+        explained = true;
+        if (alive()) this.deps.onExplain?.(topicId, { text, anchor });
       },
       onToolStart: (name, input) => {
         recorder.toolStart(name, input);
@@ -219,6 +291,7 @@ export class Tutor {
         recorder.toolEnd(name, outcome);
         report();
       },
+      search: this.deps.search?.() ?? undefined,
     });
 
     let reply = "";
@@ -243,7 +316,8 @@ export class Tutor {
         recorder.addReasoning(text);
         report();
       };
-      for await (const chunk of iterateText(session.promptStreaming(created.prompt, { signal: abort.signal, onReasoning }))) {
+      const stream = iterateText(session.promptStreaming(created.prompt, { signal: abort.signal, onReasoning }));
+      for await (const chunk of untilAborted(stream, abort.signal)) {
         if (!alive() || abort.signal.aborted) break;
         reply += chunk;
         recorder.addText(chunk);
@@ -255,8 +329,8 @@ export class Tutor {
       const dumpedSvg = extractBoardSvg(reply);
       if (shouldUseEmptyBoardFallback({ boardWasEmpty, toolSucceeded, aborted: false, reply })) {
         await this.persist(topicId, (fresh) => {
-          fresh.html = reply;
-          const title = titleFromHtml(reply);
+          fresh.html = unfence(reply);
+          const title = titleFromHtml(fresh.html);
           if (title) fresh.title = title;
         });
         toolSucceeded = true;
@@ -272,16 +346,16 @@ export class Tutor {
           recorder.trace.rawReply = reply;
           recorder.trace.fallback = "svg";
         }
-      } else if (!toolSucceeded && !boardWasEmpty && options.note !== false && reply.trim() && !replyIsToolDump(reply)) {
+      } else if (!toolSucceeded && !explained && !boardWasEmpty && options.note !== false && reply.trim() && !replyIsToolDump(reply)) {
         await this.persist(topicId, (fresh) => {
-          fresh.html = insertNote(sourcesOf(fresh), anchor, { question: trimmed, reply: reply.trim() });
+          fresh.html = insertNote(sourcesOf(fresh), anchor, { question: trimmed, reply: stripSelectionMarkers(unfence(reply)).trim() });
         });
         toolSucceeded = true;
         recorder.trace.rawReply = reply;
         recorder.trace.fallback = "note";
       }
       this.measure(recorder, session);
-      if (!toolSucceeded) {
+      if (!toolSucceeded && !explained) {
         recorder.trace.error = NOTHING_CHANGED;
         this.deps.onError(NOTHING_CHANGED);
       }
@@ -339,7 +413,7 @@ export class Tutor {
     signal: AbortSignal,
   ): Promise<{ session: LanguageModelSession; initialPrompts: PromptMessage[]; prompt: string }> {
     const { prompt } = this.build(topic, question, anchor);
-    const session = await model.create(this.options(tools, signal, initialPrompts));
+    const session = await createSession(model, this.options(tools, signal, initialPrompts), signal);
     return { session, initialPrompts, prompt };
   }
 
@@ -358,7 +432,7 @@ export class Tutor {
       if (!alive()) throw Object.assign(new Error("Aborted"), { name: "AbortError" });
       const built = this.build(topic, question, anchor, maxFullSections);
       const initialPrompts: PromptMessage[] = [{ role: "system", content: built.system }];
-      const session = await model.create({
+      const session = await createSession(model, {
         ...this.options(tools, signal, initialPrompts),
         monitor: (monitor) => {
           monitor.addEventListener("downloadprogress", (event) => {
@@ -366,11 +440,16 @@ export class Tutor {
             if (typeof loaded === "number") this.deps.onDownload(loaded);
           });
         },
-      });
+      }, signal);
       const result = { session, initialPrompts, prompt: built.prompt };
       if (!session.measureInputUsage) return result;
       const assembled = `${built.system}\n${built.prompt}`;
-      const measured = await session.measureInputUsage(assembled);
+      const measured = await settleWithin(session.measureInputUsage(assembled), signal, START_TIMEOUT_MS, START_TIMEOUT).catch(
+        (error: unknown) => {
+          session.destroy();
+          throw error;
+        },
+      );
       const quota = session.inputQuota ?? this.deps.contextTokens?.() ?? 8192;
       const limit = Math.max(1, quota - 1500);
       if (measured <= limit) return result;

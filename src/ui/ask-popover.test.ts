@@ -18,13 +18,15 @@ function setup() {
   document.body.append(host);
   const asked: [string, SelectionAnchor][] = [];
   let cancelled = 0;
+  let stopped = 0;
   const popover = renderAskPopover(host, {
     onAsk: (question, at) => asked.push([question, at]),
     onCancel: () => (cancelled += 1),
+    onStop: () => (stopped += 1),
   });
   const panel = host.querySelector<HTMLFormElement>(".ask-popover")!;
   const field = panel.querySelector("textarea")!;
-  return { host, popover, panel, field, asked, cancelled: () => cancelled };
+  return { host, popover, panel, field, asked, cancelled: () => cancelled, stopped: () => stopped };
 }
 
 describe("ask popover", () => {
@@ -60,6 +62,22 @@ describe("ask popover", () => {
     expect(cancelled()).toBe(1);
     expect(popover.anchor()).toBeNull();
     expect(popover.question()).toBe("");
+    host.remove();
+  });
+
+  it("turns Cancel into Stop while an ask runs", () => {
+    const { popover, panel, stopped, cancelled, host } = setup();
+    popover.show(anchor);
+    popover.setBusy(true);
+    const button = panel.querySelector<HTMLButtonElement>(".ask-cancel")!;
+    expect(button.textContent).toBe("Stop");
+    expect(button.disabled).toBe(false);
+    button.click();
+    expect(stopped()).toBe(1);
+    expect(cancelled()).toBe(0);
+    expect(panel.hidden).toBe(false);
+    popover.setBusy(false);
+    expect(button.textContent).toBe("Cancel");
     host.remove();
   });
 

@@ -1,7 +1,8 @@
+// @vitest-environment happy-dom
 import { describe, expect, it } from "vitest";
 import { createEmptyTopic, type TopicRepository } from "../storage/db.ts";
 import type { TopicRecord } from "../types.ts";
-import { createWhiteboardTools, VIEW_ALL_CHAR_LIMIT, WHITEBOARD_TOOL_SPECS } from "./tools.ts";
+import { compactResults, createWhiteboardTools, toolSpecs, VIEW_ALL_CHAR_LIMIT, WEB_SEARCH_TOOL_SPEC, WHITEBOARD_TOOL_SPECS } from "./tools.ts";
 
 function memoryRepo(initial: TopicRecord[]): TopicRepository & { all(): TopicRecord[] } {
   const map = new Map(initial.map((topic) => [topic.id, structuredClone(topic)]));
@@ -34,6 +35,55 @@ function hostFor(topic: TopicRecord, repo: TopicRepository, openId: () => string
     onDocument: () => {},
   };
 }
+
+describe("web_search tool", () => {
+  const response = {
+    query: "q",
+    provider: "google" as const,
+    note: "No Tavily API key; results from Google",
+    results: [{ title: "T", url: "https://a.example/", snippet: "x".repeat(400), score: null }],
+  };
+
+  it("is offered only when the host can search", () => {
+    const topic = createEmptyTopic(1);
+    const repo = memoryRepo([topic]);
+    expect(createWhiteboardTools(hostFor(topic, repo, () => topic.id)).some((tool) => tool.name === "web_search")).toBe(false);
+    const tools = createWhiteboardTools({ ...hostFor(topic, repo, () => topic.id), search: async () => response });
+    expect(tools.at(-1)?.name).toBe("web_search");
+    expect(toolSpecs(true)).toEqual([...WHITEBOARD_TOOL_SPECS, WEB_SEARCH_TOOL_SPEC]);
+    expect(toolSpecs(false)).toBe(WHITEBOARD_TOOL_SPECS);
+  });
+
+  it("returns numbered results with short snippets", async () => {
+    const topic = createEmptyTopic(1);
+    const calls: [string, number][] = [];
+    const tool = createWhiteboardTools({
+      ...hostFor(topic, memoryRepo([topic]), () => topic.id),
+      search: async (query, max) => (calls.push([query, max]), response),
+    }).find((item) => item.name === "web_search")!;
+    const out = (await tool.execute('{"query":" photosynthesis ","max_results":20}')) as ReturnType<typeof compactResults>;
+    expect(calls).toEqual([["photosynthesis", 10]]);
+    expect(out).toEqual({
+      query: "q",
+      provider: "google",
+      note: "No Tavily API key; results from Google",
+      results: [{ n: 1, title: "T", url: "https://a.example/", snippet: `${"x".repeat(300)}…` }],
+    });
+  });
+
+  it("explains a site the extension does not allow", async () => {
+    const topic = createEmptyTopic(1);
+    const denied = Object.assign(new Error("Web search is not enabled for this site"), { name: "NotAllowedError" });
+    const tool = createWhiteboardTools({
+      ...hostFor(topic, memoryRepo([topic]), () => topic.id),
+      search: async () => {
+        throw denied;
+      },
+    }).find((item) => item.name === "web_search")!;
+    await expect(tool.execute({ query: "x" })).rejects.toThrow("Web search is not available: Web search is not enabled for this site");
+    await expect(tool.execute({ query: " " })).rejects.toThrow("query must be a non-empty string.");
+  });
+});
 
 describe("whiteboard tools", () => {
   it("sets, views, and snapshots one component", async () => {
@@ -124,5 +174,66 @@ describe("whiteboard tools", () => {
       ["start", "whiteboard_set", { component: "json", source: "{" }],
       ["end", "whiteboard_set", { error: "json must be empty or a JSON string." }],
     ]);
+  });
+
+  it("inserts new html after the selection without rewriting the page", async () => {
+    const topic = { ...createEmptyTopic(20), html: "<h1>C++</h1><section><h2>5. Functions</h2><p>Body</p></section><section><h2>6. Loops</h2></section>" };
+    const repo = memoryRepo([topic]);
+    const anchor = {
+      kind: "element" as const,
+      component: "html" as const,
+      selector: "body > section:nth-of-type(1) > h2:nth-of-type(1)",
+      tag: "h2",
+      quote: { exact: "5. Functions", prefix: "", suffix: "" },
+      outerHTML: "<h2>5. Functions</h2>",
+      rect: { x: 0, y: 0, width: 0, height: 0 },
+    };
+    const insert = createWhiteboardTools({ ...hostFor(topic, repo, () => topic.id), anchor }).find((tool) => tool.name === "whiteboard_insert")!;
+    const result = (await insert.execute({ html: "<section><h2>Try it</h2><!-- ▶ LEARNER SELECTION --></section>" })) as { placed: string };
+    expect(result.placed).toBe("after selection");
+    const html = repo.all()[0]!.html;
+    expect(html).toContain("<h2>5. Functions</h2><section><h2>Try it</h2></section><p>Body</p>");
+    expect(html).toContain("<h2>6. Loops</h2>");
+    expect(html).not.toContain("LEARNER SELECTION");
+
+    const atEnd = createWhiteboardTools(hostFor(topic, repo, () => topic.id)).find((tool) => tool.name === "whiteboard_insert")!;
+    expect(await atEnd.execute({ html: "<p>Last</p>" })).toMatchObject({ placed: "at the end" });
+    expect(repo.all()[0]!.html.endsWith("<p>Last</p>")).toBe(true);
+    await expect(atEnd.execute({ html: "  " })).rejects.toThrow("non-empty");
+  });
+
+  it("edits one exact piece of a source", async () => {
+    const topic = { ...createEmptyTopic(21), html: "<h1>Old</h1><p>a</p><p>a</p>", json: '{"n":1}' };
+    const repo = memoryRepo([topic]);
+    const edit = createWhiteboardTools(hostFor(topic, repo, () => topic.id)).find((tool) => tool.name === "whiteboard_edit")!;
+    await edit.execute({ component: "html", find: "<h1>Old</h1>", replace: "<h1>New</h1>" });
+    expect(repo.all()[0]!.html).toBe("<h1>New</h1><p>a</p><p>a</p>");
+    expect(repo.all()[0]!.title).toBe("New");
+    await expect(edit.execute({ component: "html", find: "<p>a</p>", replace: "" })).rejects.toThrow("more than once");
+    await expect(edit.execute({ component: "html", find: "<p>z</p>", replace: "" })).rejects.toThrow("does not appear");
+    await expect(edit.execute({ component: "json", find: "1}", replace: "1" })).rejects.toThrow("does not parse");
+  });
+  it("explains without saving anything", async () => {
+    const topic = { ...createEmptyTopic(9), html: "<p>Leaves hold chlorophyll.</p>" };
+    const repo = memoryRepo([topic]);
+    let open: string | null = topic.id;
+    const shown: string[] = [];
+    const tools = createWhiteboardTools({ ...hostFor(topic, repo, () => open), onExplain: (text) => shown.push(text) });
+    const explain = tools.find((tool) => tool.name === "whiteboard_explain");
+    if (!explain) throw new Error("missing tool");
+
+    expect(await explain.execute({ text: "  A green pigment.\n\nIt absorbs light. " })).toEqual({
+      shown: true,
+      saved: false,
+      characters: 35,
+    });
+    expect(shown).toEqual(["A green pigment.\n\nIt absorbs light."]);
+    expect(repo.all()[0]).toEqual(topic);
+
+    await expect(explain.execute({ text: "   " })).rejects.toThrow("text is empty.");
+    await expect(explain.execute({ text: 3 })).rejects.toThrow("text must be a string.");
+    open = null;
+    await expect(explain.execute({ text: "Late." })).rejects.toThrow("no longer open");
+    expect(shown).toHaveLength(1);
   });
 });

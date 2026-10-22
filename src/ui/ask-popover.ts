@@ -3,6 +3,8 @@ import type { SelectionAnchor } from "../types.ts";
 export interface AskHandlers {
   onAsk: (question: string, anchor: SelectionAnchor) => void;
   onCancel: () => void;
+  /** Stop the running ask. The panel's Cancel button turns into Stop while one runs. */
+  onStop?: () => void;
   /** The question or the selection changed. */
   onInput?: () => void;
 }
@@ -22,6 +24,28 @@ export interface AskPopover {
 const GAP = 8;
 const WIDTH = 320;
 const QUOTE_LIMIT = 140;
+
+/**
+ * Put a floating panel in `host` under the rect, or above it when there is no room below.
+ * No rect pins it to the top-right corner.
+ */
+export function placeNear(panel: HTMLElement, host: HTMLElement, rect: SelectionAnchor["rect"] | null, maxWidth = WIDTH): void {
+  const width = Math.min(maxWidth, Math.max(0, host.clientWidth - GAP * 2));
+  panel.style.width = `${width}px`;
+  const height = panel.offsetHeight;
+  const maxLeft = Math.max(GAP, host.clientWidth - width - GAP);
+  if (!rect) {
+    panel.style.left = `${maxLeft}px`;
+    panel.style.top = `${GAP}px`;
+    return;
+  }
+  const left = Math.min(Math.max(GAP, rect.x), maxLeft);
+  let top = rect.y + rect.height + GAP;
+  if (top + height > host.clientHeight - GAP) top = rect.y - height - GAP;
+  top = Math.max(GAP, Math.min(top, Math.max(GAP, host.clientHeight - height - GAP)));
+  panel.style.left = `${left}px`;
+  panel.style.top = `${top}px`;
+}
 
 function quoteText(anchor: SelectionAnchor): string {
   const text = anchor.quote.exact || `<${anchor.tag}>`;
@@ -67,21 +91,11 @@ export function renderAskPopover(host: HTMLElement, handlers: AskHandlers): AskP
   const sync = () => {
     field.disabled = busy;
     ask.disabled = busy || !enabled;
-    cancel.disabled = busy;
+    cancel.textContent = busy ? "Stop" : "Cancel";
+    cancel.classList.toggle("is-stop", busy);
   };
 
-  const place = (anchor: SelectionAnchor) => {
-    const width = Math.min(WIDTH, Math.max(0, host.clientWidth - GAP * 2));
-    panel.style.width = `${width}px`;
-    const height = panel.offsetHeight;
-    const maxLeft = Math.max(GAP, host.clientWidth - width - GAP);
-    const left = Math.min(Math.max(GAP, anchor.rect.x), maxLeft);
-    let top = anchor.rect.y + anchor.rect.height + GAP;
-    if (top + height > host.clientHeight - GAP) top = anchor.rect.y - height - GAP;
-    top = Math.max(GAP, Math.min(top, Math.max(GAP, host.clientHeight - height - GAP)));
-    panel.style.left = `${left}px`;
-    panel.style.top = `${top}px`;
-  };
+  const place = (anchor: SelectionAnchor) => placeNear(panel, host, anchor.rect);
 
   const view: AskPopover = {
     show(anchor) {
@@ -145,7 +159,10 @@ export function renderAskPopover(host: HTMLElement, handlers: AskHandlers): AskP
     panel.requestSubmit();
   });
   field.addEventListener("input", () => handlers.onInput?.());
-  cancel.addEventListener("click", cancelNow);
+  cancel.addEventListener("click", () => {
+    if (busy) handlers.onStop?.();
+    else cancelNow();
+  });
   // A click elsewhere in the app closes an empty panel; a typed question stays until Cancel or Escape.
   document.addEventListener("mousedown", (event) => {
     if (panel.hidden || panel.contains(event.target as Node) || field.value.trim()) return;

@@ -1,8 +1,17 @@
 // @vitest-environment happy-dom
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createEmptyTopic, type TopicRepository } from "../storage/db.ts";
 import type { CreateOptions, LanguageModelAPI, LanguageModelSession, SelectionAnchor, TopicRecord, TurnTrace } from "../types.ts";
-import { extractBoardSvg, NOTHING_CHANGED, shouldUseEmptyBoardFallback, Tutor, type TutorDeps } from "./turn.ts";
+import {
+  extractBoardSvg,
+  NOTHING_CHANGED,
+  shouldUseEmptyBoardFallback,
+  START_TIMEOUT,
+  START_TIMEOUT_MS,
+  Tutor,
+  unfence,
+  type TutorDeps,
+} from "./turn.ts";
 
 function memoryRepo(initial: TopicRecord[]): TopicRepository & { all(): TopicRecord[] } {
   const map = new Map(initial.map((topic) => [topic.id, structuredClone(topic)]));
@@ -121,7 +130,48 @@ const anchor: SelectionAnchor = {
   rect: { x: 0, y: 0, width: 10, height: 10 },
 };
 
+describe("unfence", () => {
+  it("takes the code out of a fenced reply and leaves other text alone", () => {
+    expect(unfence("```html\n<h1>Hi</h1>\n```")).toBe("<h1>Hi</h1>");
+    expect(unfence("  ```\n<p>x</p>```  ")).toBe("<p>x</p>");
+    expect(unfence("<h1>Hi</h1>")).toBe("<h1>Hi</h1>");
+    expect(unfence("Text ```js\nx\n``` more")).toBe("Text ```js\nx\n``` more");
+  });
+});
+
 describe("tutor", () => {
+  it("offers web_search and its instructions only while search is on", async () => {
+    const topic = createEmptyTopic(1);
+    const searched: string[] = [];
+    const { model, creates } = scriptedModel(async function* (options) {
+      if (options.tools?.some((tool) => tool.name === "web_search")) {
+        const found = (await callTool(options, "web_search", { query: "latest Mars rover" })) as { results: { url: string }[] };
+        await callTool(options, "whiteboard_set", { component: "html", source: `<a href="${found.results[0]!.url}">source</a>` });
+      }
+      yield "done";
+    });
+    let on = true;
+    const { tutor, repo } = tutorFor(topic, model, {
+      search: () =>
+        on
+          ? async (query) => {
+              searched.push(query);
+              return { query, provider: "tavily", results: [{ title: "R", url: "https://nasa.example/", snippet: "s", score: 1 }] };
+            }
+          : null,
+    });
+
+    await tutor.ask(topic.id, "What is the latest Mars rover?");
+    on = false;
+    await tutor.ask(topic.id, "And before that?");
+
+    expect(searched).toEqual(["latest Mars rover"]);
+    expect(repo.all()[0]?.html).toContain('<a href="https://nasa.example/">source</a>');
+    expect(creates[0]?.initialPrompts?.[0]?.content).toContain("# Web search");
+    expect(creates[1]?.tools?.some((tool) => tool.name === "web_search")).toBe(false);
+    expect(creates[1]?.initialPrompts?.[0]?.content).not.toContain("# Web search");
+  });
+
   it("creates a new session with only a system prompt for every ask and saves only the board", async () => {
     const topic = createEmptyTopic(1);
     const source = "<h1>Photosynthesis</h1><p>Leaves capture sunlight.</p>";
@@ -195,6 +245,26 @@ describe("tutor", () => {
     expect(errors.at(-1)).toBeNull();
   });
 
+  it("shows an explanation without changing the board or adding a note", async () => {
+    const topic = { ...createEmptyTopic(4), html: "<p>Leaves hold chlorophyll.</p><p>Roots.</p>" };
+    const { model } = scriptedModel(async function* (options) {
+      await callTool(options, "whiteboard_explain", { text: "A green pigment." });
+      yield "Chlorophyll is a green pigment.";
+    });
+    const explained: { topicId: string; text: string; anchor: SelectionAnchor | null }[] = [];
+    const { tutor, repo, traces, errors } = tutorFor(topic, model, {
+      onExplain: (topicId, { text, anchor: at }) => explained.push({ topicId, text, anchor: at }),
+    });
+
+    await tutor.ask(topic.id, "What is chlorophyll?", { anchor });
+
+    expect(explained).toEqual([{ topicId: topic.id, text: "A green pigment.", anchor }]);
+    expect(repo.all()[0]?.html).toBe(topic.html);
+    expect(traces.at(-1)?.trace.fallback).toBeUndefined();
+    expect(traces.at(-1)?.trace.error).toBeUndefined();
+    expect(errors.at(-1)).toBeNull();
+  });
+
   it("reports an ask that changed nothing", async () => {
     const topic = { ...createEmptyTopic(4), html: "<p>Leaves.</p>" };
     const { model } = scriptedModel(async function* () {
@@ -210,7 +280,7 @@ describe("tutor", () => {
 
   it("moves an empty-board lesson printed as text into the html", async () => {
     const topic = createEmptyTopic(5);
-    const reply = lessonReply();
+    const reply = `\`\`\`html\n${lessonReply()}\`\`\``;
     const { model } = scriptedModel(async function* () {
       yield reply;
     });
@@ -219,6 +289,7 @@ describe("tutor", () => {
     await tutor.ask(topic.id, "Teach me photosynthesis");
     const stored = repo.all()[0];
     expect(stored?.html).toContain("Plants store energy from light.");
+    expect(stored?.html.startsWith("<h1>Photosynthesis</h1>")).toBe(true);
     expect(stored?.title).toBe("Photosynthesis");
     expect(traces.at(-1)?.trace.rawReply).toBe(reply);
     expect(traces.at(-1)?.trace.fallback).toBe("html");
@@ -291,6 +362,68 @@ describe("tutor", () => {
     expect(trace?.error).toBe("Stopped");
     expect(trace?.events).toEqual([{ kind: "text", text: "Partial" }]);
     expect(setup.repo.all()[0]?.html).toBe("<p>Leaves.</p>");
+  });
+
+  it("stops at once when the backend never yields again", async () => {
+    const topic = { ...createEmptyTopic(10), html: "<p>Leaves.</p>" };
+    const { model } = scriptedModel(async function* () {
+      yield "Working";
+      await new Promise(() => {});
+    });
+    const { tutor, traces } = tutorFor(topic, model);
+    const running = tutor.ask(topic.id, "Add a section");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    tutor.stop();
+    await running;
+    expect(tutor.isBusy).toBe(false);
+    expect(traces.at(-1)?.trace.error).toBe("Stopped");
+  });
+
+  it("stops, or times out, while the model never finishes starting, and destroys a late session", async () => {
+    const topic = { ...createEmptyTopic(11), html: "<p>Leaves.</p>" };
+    let destroyed = 0;
+    let deliver: (() => void) | undefined;
+    const model: LanguageModelAPI = {
+      async availability() {
+        return "available";
+      },
+      create() {
+        return new Promise<LanguageModelSession>((resolve) => {
+          deliver = () =>
+            resolve({
+              async *promptStreaming() {
+                yield "";
+              },
+              destroy() {
+                destroyed += 1;
+              },
+            });
+        });
+      },
+    };
+    const { tutor, traces, errors } = tutorFor(topic, model);
+
+    const stopped = tutor.ask(topic.id, "First");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(traces[0]?.trace.request).toBeUndefined();
+    tutor.stop();
+    await stopped;
+    expect(tutor.isBusy).toBe(false);
+    expect(traces.at(-1)?.trace.error).toBe("Stopped");
+    deliver?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(destroyed).toBe(1);
+
+    vi.useFakeTimers();
+    try {
+      const timedOut = tutor.ask(topic.id, "Second");
+      await vi.advanceTimersByTimeAsync(START_TIMEOUT_MS + 1);
+      await timedOut;
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(tutor.isBusy).toBe(false);
+    expect(errors.at(-1)).toBe(START_TIMEOUT);
   });
 
   it("uses a pinned system prompt and sends an edited request once", async () => {

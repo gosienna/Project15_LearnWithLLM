@@ -1,5 +1,5 @@
 import type { ModelInfo } from "../types.ts";
-import { WHITEBOARD_TOOL_INFO } from "../llm/tools.ts";
+import { WEB_SEARCH_TOOL_SPEC, WHITEBOARD_TOOL_INFO } from "../llm/tools.ts";
 
 export interface SystemPanel {
   open(models: ModelInfo[], chosenId: string | null, note?: string | null): void;
@@ -33,7 +33,8 @@ export function renderSystemPanel(onChoose: (id: string) => void): SystemPanel {
   toolsTitle.textContent = "Tools for the model";
   const toolList = document.createElement("ul");
   toolList.className = "system-tools";
-  for (const tool of WHITEBOARD_TOOL_INFO) {
+  const webSearchInfo = { name: WEB_SEARCH_TOOL_SPEC.name, description: `${WEB_SEARCH_TOOL_SPEC.description} Offered only while Web search is on.` };
+  for (const tool of [...WHITEBOARD_TOOL_INFO, webSearchInfo]) {
     const item = document.createElement("li");
     const name = document.createElement("code");
     name.textContent = tool.name;
