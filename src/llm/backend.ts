@@ -46,6 +46,11 @@ export function searchAvailable(win: Pick<BackendWindow, "localLLM">): boolean {
   return typeof win.localLLM?.search === "function";
 }
 
+/** The extension can download images found by search, for saving with the topic. */
+export function fetchImageAvailable(win: Pick<BackendWindow, "localLLM">): boolean {
+  return typeof win.localLLM?.fetchImage === "function";
+}
+
 export function waitForLanguageModel(win: BackendWindow, timeout = 500): Promise<LanguageModelAPI | null> {
   if (win.LanguageModel) return Promise.resolve(win.LanguageModel);
   return new Promise((resolve) => {

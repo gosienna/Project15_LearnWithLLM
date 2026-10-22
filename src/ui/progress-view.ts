@@ -35,6 +35,13 @@ export function toolLabel(event: ToolEvent): string {
       return "Reading what the page says";
     case "whiteboard_store_material":
       return "Storing the learning material";
+    case "whiteboard_add_image": {
+      const input = event.input as { description?: unknown } | null;
+      const about = input && typeof input === "object" && typeof input.description === "string" ? input.description.trim() : "";
+      return about ? `Saving image: ${about}` : "Saving an image";
+    }
+    case "whiteboard_remove_image":
+      return "Removing an image";
     case "web_search": {
       const query = queryOf(event);
       return query ? `Searching the web: ${query}` : "Searching the web";

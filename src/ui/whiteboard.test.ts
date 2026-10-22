@@ -10,6 +10,7 @@ import {
   markSource,
   readAnchor,
   renderWhiteboard,
+  resolveBoardImages,
   SELECTION_BRIDGE,
   SELECTION_END,
   SELECTION_START,
@@ -58,6 +59,37 @@ describe("whiteboard frame", () => {
     expect(host.querySelector("h1")).toBeNull();
     expect(host.querySelector("svg")).toBeNull();
     expect(host.querySelector("script")).toBeNull();
+  });
+
+  it("swaps board-image ids for the saved images in html, css and svg, and exposes lessonImages", () => {
+    const images = { img1: "data:image/webp;base64,AAAA", img2: "https://img.example/b.jpg" };
+    const doc = assembleBoardDocument(
+      {
+        ...emptyBoard(),
+        html: '<img src="board-image:img1" alt="a"><img src="board-image:img9">',
+        css: ".hero { background: url(board-image:img2); }",
+        svg: '<svg><image href="board-image:img1"/></svg>',
+      },
+      images,
+    );
+    expect(doc).toContain('<img src="data:image/webp;base64,AAAA" alt="a">');
+    expect(doc).toContain('<img src="board-image:img9">');
+    expect(doc).toContain("url(https://img.example/b.jpg)");
+    expect(doc).toContain('<image href="data:image/webp;base64,AAAA"/>');
+    expect(doc).toContain(`globalThis.lessonImages = ${JSON.stringify(images)};`);
+    expect(resolveBoardImages("board-image:img1 board-image:toString", images)).toBe("data:image/webp;base64,AAAA board-image:toString");
+  });
+
+  it("redraws when an image's source changes", () => {
+    const host = document.createElement("div");
+    const sources = { ...emptyBoard(), html: '<img src="board-image:img1">' };
+    renderWhiteboard(host, sources, undefined, { img1: "https://img.example/a.jpg" });
+    const first = host.querySelector("iframe");
+    renderWhiteboard(host, sources, undefined, { img1: "https://img.example/a.jpg" });
+    expect(host.querySelector("iframe")).toBe(first);
+    renderWhiteboard(host, sources, undefined, { img1: "data:image/webp;base64,AAAA" });
+    expect(host.querySelector("iframe")).not.toBe(first);
+    expect(host.querySelector("iframe")?.srcdoc).toContain("data:image/webp;base64,AAAA");
   });
 
   it("omits the svg slot when that source is empty and runs the selection bridge before the lesson script", () => {

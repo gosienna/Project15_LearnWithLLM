@@ -2,7 +2,16 @@
 import { describe, expect, it } from "vitest";
 import { createEmptyTopic, type TopicRepository } from "../storage/db.ts";
 import type { TopicRecord } from "../types.ts";
-import { compactResults, createWhiteboardTools, toolSpecs, VIEW_ALL_CHAR_LIMIT, WEB_SEARCH_TOOL_SPEC, WHITEBOARD_TOOL_SPECS } from "./tools.ts";
+import {
+  compactResults,
+  createWhiteboardTools,
+  IMAGE_TOOL_SPECS,
+  IMAGES_PER_TOPIC,
+  toolSpecs,
+  VIEW_ALL_CHAR_LIMIT,
+  WEB_SEARCH_TOOL_SPEC,
+  WHITEBOARD_TOOL_SPECS,
+} from "./tools.ts";
 
 function memoryRepo(initial: TopicRecord[]): TopicRepository & { all(): TopicRecord[] } {
   const map = new Map(initial.map((topic) => [topic.id, structuredClone(topic)]));
@@ -35,6 +44,74 @@ function hostFor(topic: TopicRecord, repo: TopicRepository, openId: () => string
     onDocument: () => {},
   };
 }
+
+describe("image tools", () => {
+  const png = () => new Blob([new Uint8Array([137, 80, 78, 71])], { type: "image/png" });
+  const encodeImage = async (blob: Blob) => ({ blob: new Blob([blob], { type: "image/webp" }), width: 640, height: 480 });
+
+  function setup(fetchImage: (url: string) => Promise<Blob> = async () => png()) {
+    const topic = createEmptyTopic(1);
+    const repo = memoryRepo([topic]);
+    const fetched: string[] = [];
+    const tools = createWhiteboardTools({
+      ...hostFor(topic, repo, () => topic.id),
+      fetchImage: (url) => (fetched.push(url), fetchImage(url)),
+      encodeImage,
+    });
+    const tool = (name: string) => tools.find((item) => item.name === name)!;
+    return { topic, repo, fetched, tool, tools };
+  }
+
+  it("are offered only when the host can fetch images", () => {
+    const topic = createEmptyTopic(1);
+    const plain = createWhiteboardTools(hostFor(topic, memoryRepo([topic]), () => topic.id));
+    expect(plain.some((tool) => tool.name === "whiteboard_add_image")).toBe(false);
+    expect(setup().tools.slice(-2).map((tool) => tool.name)).toEqual(["whiteboard_add_image", "whiteboard_remove_image"]);
+    expect(toolSpecs(true, true)).toEqual([...WHITEBOARD_TOOL_SPECS, WEB_SEARCH_TOOL_SPEC, ...IMAGE_TOOL_SPECS]);
+    expect(toolSpecs(false, false)).toBe(WHITEBOARD_TOOL_SPECS);
+  });
+
+  it("saves a re-encoded copy, reuses the id for the same url, and lists images in view all", async () => {
+    const { repo, fetched, tool } = setup();
+    const out = await tool("whiteboard_add_image").execute({ url: "https://img.example/a.jpg", description: " Eiffel Tower ", source_url: "https://site.example/" });
+    expect(out).toEqual({ id: "img1", ref: "board-image:img1", cached: true, width: 640, height: 480 });
+    const again = await tool("whiteboard_add_image").execute({ url: "https://img.example/a.jpg", description: "again" });
+    expect(again).toMatchObject({ id: "img1", existing: true });
+    expect(fetched).toEqual(["https://img.example/a.jpg"]);
+    const saved = repo.all()[0]!.images!;
+    expect(saved).toHaveLength(1);
+    expect(saved[0]).toMatchObject({ id: "img1", description: "Eiffel Tower", sourceUrl: "https://site.example/", type: "image/webp", width: 640 });
+    expect(saved[0]!.blob).not.toBeNull();
+    expect(await tool("whiteboard_view").execute({ component: "all" })).toMatchObject({
+      images: [{ id: "img1", description: "Eiffel Tower", url: "https://img.example/a.jpg", cached: true }],
+    });
+  });
+
+  it("keeps the url when the download fails, numbers new ids, and removes", async () => {
+    const denied = Object.assign(new Error("Only images returned by search can be fetched"), { name: "NotAllowedError" });
+    const { repo, tool } = setup(async (url) => {
+      if (url.includes("bad")) throw denied;
+      return png();
+    });
+    await tool("whiteboard_add_image").execute({ url: "https://img.example/a.jpg", description: "A" });
+    const failed = (await tool("whiteboard_add_image").execute({ url: "https://img.example/bad.jpg", description: "B" })) as Record<string, unknown>;
+    expect(failed).toMatchObject({ id: "img2", cached: false });
+    expect(String(failed.note)).toContain("Only images returned by search can be fetched");
+    expect(repo.all()[0]!.images![1]!.blob).toBeNull();
+    expect(await tool("whiteboard_remove_image").execute({ id: "board-image:img1" })).toEqual({ removed: "img1", images: 1 });
+    expect(await tool("whiteboard_add_image").execute({ url: "https://img.example/c.jpg", description: "C" })).toMatchObject({ id: "img3" });
+    await expect(tool("whiteboard_remove_image").execute({ id: "img9" })).rejects.toThrow("There is no image img9");
+  });
+
+  it("rejects bad input and caps the topic", async () => {
+    const { repo, topic, tool } = setup();
+    await expect(tool("whiteboard_add_image").execute({ url: "javascript:alert(1)", description: "x" })).rejects.toThrow("url must be an http or https url.");
+    await expect(tool("whiteboard_add_image").execute({ url: "https://img.example/a.jpg", description: " " })).rejects.toThrow("description must be a non-empty string.");
+    const full = { ...topic, images: Array.from({ length: IMAGES_PER_TOPIC }, (_, i) => ({ id: `img${i + 1}`, url: `https://img.example/${i}.jpg`, description: "x", blob: null, addedAt: 1 })) };
+    await repo.put(full);
+    await expect(tool("whiteboard_add_image").execute({ url: "https://img.example/new.jpg", description: "x" })).rejects.toThrow(`already has ${IMAGES_PER_TOPIC} images`);
+  });
+});
 
 describe("web_search tool", () => {
   const response = {
@@ -69,6 +146,21 @@ describe("web_search tool", () => {
       note: "No Tavily API key; results from Google",
       results: [{ n: 1, title: "T", url: "https://a.example/", snippet: `${"x".repeat(300)}…` }],
     });
+  });
+
+  it("asks for images and lists at most five", async () => {
+    const topic = createEmptyTopic(1);
+    const calls: unknown[][] = [];
+    const images = Array.from({ length: 7 }, (_, i) => ({ url: `https://img.example/${i}.jpg`, ...(i === 0 ? { description: "Leaf", sourceUrl: "https://a.example/" } : {}) }));
+    const tool = createWhiteboardTools({
+      ...hostFor(topic, memoryRepo([topic]), () => topic.id),
+      search: async (...args) => (calls.push(args), { ...response, images }),
+    }).find((item) => item.name === "web_search")!;
+    const out = (await tool.execute({ query: "leaf", include_images: true })) as ReturnType<typeof compactResults>;
+    expect(calls).toEqual([["leaf", 5, true]]);
+    expect(out.images).toHaveLength(5);
+    expect((out.images as unknown[])[0]).toEqual({ n: 1, url: "https://img.example/0.jpg", description: "Leaf", source: "https://a.example/" });
+    expect((out.images as unknown[])[1]).toEqual({ n: 2, url: "https://img.example/1.jpg" });
   });
 
   it("explains a site the extension does not allow", async () => {

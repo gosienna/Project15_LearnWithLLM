@@ -4,7 +4,16 @@ import { serializeLesson } from "../document/markdown.ts";
 import type { SelectionAnchor } from "../types.ts";
 import { emptyBoard, SELECTION_END, SELECTION_START } from "../ui/whiteboard.ts";
 import { KATEX_MODULE } from "../ui/board-modules.ts";
-import { buildPrompt, estimateTokens, INSTRUCTIONS, sourceWindow, WEB_SEARCH_INSTRUCTIONS, whiteboardPreface } from "./system-prompt.ts";
+import {
+  boardStatus,
+  buildPrompt,
+  estimateTokens,
+  IMAGE_INSTRUCTIONS,
+  INSTRUCTIONS,
+  sourceWindow,
+  WEB_SEARCH_INSTRUCTIONS,
+  whiteboardPreface,
+} from "./system-prompt.ts";
 
 function anchor(overrides: Partial<SelectionAnchor> = {}): SelectionAnchor {
   return {
@@ -124,6 +133,28 @@ describe("system prompt", () => {
     });
     expect(system).toBe("You are a pirate tutor.");
     expect(prompt).toContain(SELECTION_START);
+  });
+});
+
+describe("image instructions", () => {
+  it("follow web search when the ask offers whiteboard_add_image, and the status lists saved images", () => {
+    const base = { sources: { ...emptyBoard(), html: "<p>x</p>" }, materialMarkdown: "", question: "Q" };
+    const images = [{ id: "img1", description: "Eiffel Tower" }];
+    const system = buildPrompt({ ...base, webSearch: true, imageTools: true, images }).system;
+    expect(system).toContain(`${WEB_SEARCH_INSTRUCTIONS}\n\n${IMAGE_INSTRUCTIONS}\n\n# Whiteboard`);
+    expect(system).toContain("Images: img1 (Eiffel Tower).");
+    expect(buildPrompt({ ...base, webSearch: true }).system).not.toContain("# Images");
+    expect(boardStatus(emptyBoard(), images)).toBe("The whiteboard is empty.\nImages: img1 (Eiffel Tower).");
+  });
+
+  it("follow the switch in a pinned system prompt", () => {
+    const base = { sources: emptyBoard(), materialMarkdown: "", question: "Q", systemOverride: "You are a pirate tutor." };
+    expect(buildPrompt({ ...base, webSearch: true, imageTools: true }).system).toBe(
+      `You are a pirate tutor.\n\n${WEB_SEARCH_INSTRUCTIONS}\n\n${IMAGE_INSTRUCTIONS}`,
+    );
+    const copied = whiteboardPreface("The whiteboard is empty.", false, true, true);
+    expect(buildPrompt({ ...base, systemOverride: copied, webSearch: false }).system).not.toContain("# Images");
+    expect(buildPrompt({ ...base, systemOverride: copied, webSearch: true, imageTools: true }).system.split("# Images")).toHaveLength(2);
   });
 });
 

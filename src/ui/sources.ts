@@ -1,4 +1,4 @@
-import { BOARD_COMPONENTS, type BoardComponent, type BoardSources, type PromptMessage, type SelectionAnchor, type TurnTrace } from "../types.ts";
+import { BOARD_COMPONENTS, type BoardComponent, type BoardImage, type BoardSources, type PromptMessage, type SelectionAnchor, type TurnTrace } from "../types.ts";
 import { BOARD_MODULES, type BoardModule } from "./board-modules.ts";
 import type { UiMode } from "./mode.ts";
 import {
@@ -10,9 +10,9 @@ import {
 } from "./request-editor.ts";
 import { renderTraceList } from "./trace-view.ts";
 
-export type SourceTab = "preview" | BoardComponent | "modules" | "material" | "system" | "request" | "trace";
+export type SourceTab = "preview" | BoardComponent | "images" | "modules" | "material" | "system" | "request" | "trace";
 
-export const SOURCE_TABS: readonly SourceTab[] = ["preview", ...BOARD_COMPONENTS, "modules", "material", "system", "request", "trace"];
+export const SOURCE_TABS: readonly SourceTab[] = ["preview", ...BOARD_COMPONENTS, "images", "modules", "material", "system", "request", "trace"];
 
 const INPUT_TABS: readonly SourceTab[] = ["system", "request", "trace"];
 
@@ -23,6 +23,7 @@ const TAB_LABELS: Record<SourceTab, string> = {
   js: "JS",
   svg: "SVG",
   json: "JSON",
+  images: "Images",
   modules: "Modules",
   material: "Material",
   system: "System prompt",
@@ -38,6 +39,8 @@ export interface SourceView {
 
 export interface SourceContent extends BoardSources {
   material: string;
+  /** The topic's saved images. */
+  images?: readonly BoardImage[];
 }
 
 /** The model input of the open topic. Read lazily: building it costs a prompt build per paint. */
@@ -130,6 +133,10 @@ export function renderSources(view: SourceView, content: SourceContent, mode: Ui
 
   if (tab === "modules") {
     renderModules(view.pane);
+    return;
+  }
+  if (tab === "images") {
+    renderImages(view.pane, content.images ?? []);
     return;
   }
 
@@ -243,10 +250,67 @@ function renderModules(pane: HTMLElement): void {
   pane.replaceChildren(...BOARD_MODULES.map(moduleCard));
 }
 
+/** Object URLs of the Images tab's thumbnails, revoked when it redraws. */
+const thumbnails = new WeakMap<HTMLElement, string[]>();
+
+/** The topic's saved images: the cached copy, its id for board-image:ID, and where it came from. */
+function renderImages(pane: HTMLElement, images: readonly BoardImage[]): void {
+  const key = `images\u0000${images.map((image) => `${image.id}:${image.blob?.size ?? "url"}`).join(",")}`;
+  if (shown.get(pane) === key) return;
+  shown.set(pane, key);
+  for (const url of thumbnails.get(pane) ?? []) URL.revokeObjectURL(url);
+  const urls: string[] = [];
+  thumbnails.set(pane, urls);
+  if (images.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "source-meta";
+    empty.textContent = "No saved images. The model saves pictures from web search with whiteboard_add_image.";
+    pane.replaceChildren(empty);
+    return;
+  }
+  const grid = document.createElement("div");
+  grid.className = "image-grid";
+  for (const image of images) {
+    const card = document.createElement("figure");
+    card.className = "image-card";
+    const img = document.createElement("img");
+    img.alt = image.description;
+    img.referrerPolicy = "no-referrer";
+    if (image.blob) {
+      const url = URL.createObjectURL(image.blob);
+      urls.push(url);
+      img.src = url;
+    } else {
+      img.src = image.url;
+    }
+    const caption = document.createElement("figcaption");
+    const id = document.createElement("code");
+    id.textContent = `board-image:${image.id}`;
+    const about = document.createElement("span");
+    about.textContent = image.description;
+    const meta = document.createElement("span");
+    meta.className = "source-meta";
+    const size = image.width ? `${image.width}×${image.height}` : "";
+    meta.textContent = [image.blob ? `cached · ${Math.max(1, Math.round(image.blob.size / 1024))} KB` : "not cached · original url", size]
+      .filter(Boolean)
+      .join(" · ");
+    const link = document.createElement("a");
+    link.href = image.sourceUrl ?? image.url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = image.sourceUrl ? "Source page" : "Original";
+    caption.append(id, about, meta, link);
+    card.append(img, caption);
+    grid.append(card);
+  }
+  pane.replaceChildren(grid);
+}
+
 /** Characters of a source, the number of modules, or the number of traces; nothing for the other tabs. */
 function tabCount(id: SourceTab, content: SourceContent, inputs?: PromptInputs): number | undefined {
   if (id === "trace") return inputs?.traces?.().length ?? 0;
   if (id === "modules") return BOARD_MODULES.length;
+  if (id === "images") return content.images?.length ?? 0;
   if (id === "preview" || id === "system" || id === "request") return undefined;
   return content[id].length;
 }

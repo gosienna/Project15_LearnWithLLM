@@ -36,6 +36,7 @@ Facts from that contract that shape this app:
 | Text only. `responseConstraint` is not available. Iframes do not get the API. | The lesson page is a sandboxed iframe. The app itself stays a top-level page so it can call the API. The iframe does not. |
 | The user picks the model. The page cannot. | Read `localLLM.info()` for the status line only. |
 | `localLLM.search(query, { maxResults })` (newer extensions) searches the web: Tavily with the user's key, or a Google results page in a minimized window when Tavily is missing or out of credits. It rejects with `NotAllowedError` unless the user ticked **Allow web search** for the site, and allows 10 searches per minute per site. | A **Web search** toolbar switch (off by default, kept in localStorage) adds a page-side `web_search` tool that calls `localLLM.search` and returns numbered results with short snippets, plus a `# Web search` section in the system prompt asking for a Sources list of links. The switch is disabled when the extension has no `search`. The lesson iframe allows popups so Sources links open in a new tab. |
+| `localLLM.search(query, { includeImages: true })` adds `images: [{url, description?, sourceUrl?}]`. `localLLM.fetchImage(url)` (newer extensions) downloads one of those urls and resolves to `{url, type, blob}`; it needs the same site switch, and rejects urls the site's own searches did not return. | With web search on and `fetchImage` present, `whiteboard_add_image` and `whiteboard_remove_image` are offered, and saved copies are stored on the topic (see Saved images). |
 
 Sampling: if the app sets `temperature` it also sets `topK`. Prefer `LanguageModel.params()` defaults so the user's model settings win.
 
@@ -62,7 +63,7 @@ A learner can:
 - A server-side model fallback. If `LanguageModel` is missing or `availability()` is `"unavailable"`, the composer stays disabled.
 - Learner accounts, sync, or export.
 - The learner editing the lesson by typing on the board.
-- Images, audio, quizzes as a separate widget, or browser-control tools. The extension playground's tools are not available to websites, and this app does not try to call them. Web search is the exception, through `localLLM.search` (see above).
+- Audio, quizzes as a separate widget, or browser-control tools. The extension playground's tools are not available to websites, and this app does not try to call them. Web search is the exception, through `localLLM.search`, and so are images it finds, saved through `localLLM.fetchImage` (see Saved images).
 - Multiple whiteboard documents inside one topic.
 
 ## Layout
@@ -168,7 +169,16 @@ The board repaints after every successful `whiteboard_set`. The learner sees the
 
 `document/markdown.ts` still parses stored markdown so a long `materialMarkdown` can be fitted into the system message. `document/ops.ts` remains the section-editing library and its tests. The live board does not call it.
 
-Opening a database from version 1 copies `documentMarkdown` into `materialMarkdown`, renders that markdown to static HTML for `html`, and clears `css`, `js`, `svg`, and `json`.
+Opening a database from version 1 copies `documentMarkdown` into `materialMarkdown`, renders that markdown to static HTML for `html`, and clears `css`, `js`, `svg`, and `json`. Opening it from version 1 or 2 adds `images: []`.
+
+## Saved images
+
+A topic keeps the pictures the model saved from web search in `TopicRecord.images`, so the board still shows them when the original link dies or the learner is offline.
+
+- `whiteboard_add_image {url, description, source_url?}` is offered when web search is on and the extension has `localLLM.fetchImage` (Project14 downloads only urls its own search returned for this site). The page shrinks the copy to 1280 px on the longest side and re-encodes it as webp, then stores the Blob. The same url returns its existing id; a topic holds at most 20. When the download fails the entry is kept with `blob: null` and the board uses the original url.
+- `whiteboard_remove_image {id}` deletes one. `whiteboard_view` with `"all"` lists `{id, description, url, cached}`.
+- The page refers to an image as `board-image:ID` in html, css, or svg. When the frame is assembled each known id becomes a `data:` URL of the cached copy (the frame CSP allows `data:`, and its opaque origin can't use the parent's `blob:` URLs), or the original url. Unknown ids stay as written. The lesson js also gets `globalThis.lessonImages`, `{id: src}`.
+- The system prompt lists saved images in the board status and adds an `# Images` block while the tool is offered. The Debug mode Images tab shows each copy with its id, size, and source.
 
 ## Tools
 
@@ -254,7 +264,7 @@ Do not run this fallback once the board has content. A later chat answer must st
 
 ## IndexedDB
 
-Database name `learn-with-llm`, version 2. One object store, `topics`, `keyPath: "id"`. Index `byUpdated` on `updatedAt`.
+Database name `learn-with-llm`, version 3. One object store, `topics`, `keyPath: "id"`. Index `byUpdated` on `updatedAt`.
 
 ```ts
 interface TopicRecord {
@@ -267,6 +277,7 @@ interface TopicRecord {
   json: string;               // "" when there is no data
   materialMarkdown: string;   // "" until the learner stores it
   messages: DialogueMessage[];
+  images: BoardImage[];       // pictures saved with whiteboard_add_image; see Saved images
   createdAt: number;
   updatedAt: number;
 }

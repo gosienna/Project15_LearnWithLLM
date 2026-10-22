@@ -1,7 +1,11 @@
+import { encodeBoardImage, type EncodedImage } from "../storage/board-images.ts";
 import type { TopicRepository } from "../storage/db.ts";
 import {
   BOARD_COMPONENTS,
+  BOARD_IMAGE_PREFIX,
   type BoardComponent,
+  type BoardImage,
+  type FetchImageFn,
   type BoardSources,
   type SearchFn,
   type SearchResponse,
@@ -12,6 +16,8 @@ import {
 import { insertHtml, snapshotBoard, stripSelectionMarkers, titleFromHtml } from "../ui/whiteboard.ts";
 
 export const SOURCE_CHAR_LIMIT = 200_000;
+export const IMAGES_PER_TOPIC = 20;
+export const IMAGE_DESCRIPTION_LIMIT = 300;
 export const VIEW_ALL_CHAR_LIMIT = 24_000;
 export const EXPLAIN_CHAR_LIMIT = 4_000;
 
@@ -28,6 +34,10 @@ export interface ToolHost {
   onToolEnd?: (name: string, outcome: { output: unknown } | { error: string }) => void;
   /** Set when web search is on: web_search is offered and calls it. */
   search?: SearchFn;
+  /** Set when the extension can download images: whiteboard_add_image and whiteboard_remove_image are offered. */
+  fetchImage?: FetchImageFn;
+  /** Shrinks and re-encodes a downloaded image; encodeBoardImage unless a test swaps it. */
+  encodeImage?: (blob: Blob) => Promise<EncodedImage>;
 }
 
 const COMPONENT_LIST = BOARD_COMPONENTS.join(", ");
@@ -224,25 +234,56 @@ export const WHITEBOARD_TOOL_SPECS: ModelToolInput[] = [
 export const WEB_SEARCH_TOOL_SPEC: ModelToolInput = {
   name: "web_search",
   description:
-    "Search the web for current facts or things you are unsure of. Returns results with title, url, and snippet. Put the urls you use in a Sources list on the whiteboard.",
+    "Search the web for current facts or things you are unsure of. Returns results with title, url, and snippet, and image urls when include_images is true. Put the urls you use in a Sources list on the whiteboard.",
   inputSchema: {
     type: "object",
     properties: {
       query: { type: "string", description: "The search query." },
       max_results: { type: "integer", minimum: 1, maximum: 10, description: "How many results, 5 by default." },
+      include_images: { type: "boolean", description: "Also return image urls, to show pictures on the whiteboard." },
     },
     required: ["query"],
   },
 };
 
+export const IMAGE_TOOL_SPECS: ModelToolInput[] = [
+  {
+    name: "whiteboard_add_image",
+    description:
+      "Save a picture from web_search to this topic so the whiteboard keeps it. Returns an id; show it with <img src=\"board-image:ID\" alt=\"…\">. Use only image urls web_search returned.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "The image url from web_search." },
+        description: { type: "string", description: "What the picture shows, in a few words." },
+        source_url: { type: "string", description: "The page the picture is from, when web_search gave one." },
+      },
+      required: ["url", "description"],
+    },
+  },
+  {
+    name: "whiteboard_remove_image",
+    description: "Delete a saved picture from this topic. Remove its board-image:ID from the page too.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "The id whiteboard_add_image returned, such as img1." },
+      },
+      required: ["id"],
+    },
+  },
+];
+
 export const WHITEBOARD_TOOL_INFO = WHITEBOARD_TOOL_SPECS.map(({ name, description }) => ({ name, description }));
 
-/** The tool specs an ask sends: the whiteboard tools, plus web_search when it is on. */
-export function toolSpecs(webSearch: boolean): ModelToolInput[] {
-  return webSearch ? [...WHITEBOARD_TOOL_SPECS, WEB_SEARCH_TOOL_SPEC] : WHITEBOARD_TOOL_SPECS;
+/** The tool specs an ask sends: the whiteboard tools, plus web_search and the image tools when they are on. */
+export function toolSpecs(webSearch: boolean, images = false): ModelToolInput[] {
+  if (!webSearch && !images) return WHITEBOARD_TOOL_SPECS;
+  return [...WHITEBOARD_TOOL_SPECS, ...(webSearch ? [WEB_SEARCH_TOOL_SPEC] : []), ...(images ? IMAGE_TOOL_SPECS : [])];
 }
 
 export const SNIPPET_CHAR_LIMIT = 300;
+export const IMAGE_LIMIT = 5;
 
 /** Search results as the model reads them: short snippets, numbered for citing. */
 export function compactResults(response: SearchResponse): Record<string, unknown> {
@@ -256,6 +297,16 @@ export function compactResults(response: SearchResponse): Record<string, unknown
       url: result.url,
       snippet: result.snippet.length > SNIPPET_CHAR_LIMIT ? `${result.snippet.slice(0, SNIPPET_CHAR_LIMIT)}…` : result.snippet,
     })),
+    ...(response.images
+      ? {
+          images: response.images.slice(0, IMAGE_LIMIT).map((image, index) => ({
+            n: index + 1,
+            url: image.url,
+            ...(image.description ? { description: image.description.slice(0, SNIPPET_CHAR_LIMIT) } : {}),
+            ...(image.sourceUrl ? { source: image.sourceUrl } : {}),
+          })),
+        }
+      : {}),
   };
 }
 
@@ -267,7 +318,7 @@ function webSearchTool(host: ToolHost, search: SearchFn): ToolDeclaration {
       if (typeof args.query !== "string" || args.query.trim() === "") throw new Error("query must be a non-empty string.");
       const max = Math.min(10, Math.max(1, Math.floor(Number(args.max_results)) || 5));
       try {
-        return compactResults(await search(args.query.trim(), max));
+        return compactResults(await search(args.query.trim(), max, args.include_images === true));
       } catch (error) {
         if ((error as { name?: string })?.name === "NotAllowedError") {
           throw new Error(`Web search is not available: ${(error as Error).message}`);
@@ -286,7 +337,96 @@ function spec(name: string): ModelToolInput {
 
 export function createWhiteboardTools(host: ToolHost): ToolDeclaration[] {
   const tools = boardTools(host);
-  return host.search ? [...tools, webSearchTool(host, host.search)] : tools;
+  if (host.search) tools.push(webSearchTool(host, host.search));
+  if (host.fetchImage) tools.push(...imageTools(host, host.fetchImage));
+  return tools;
+}
+
+/** Saved images as the model reads them: no image data. */
+function imageList(images: readonly BoardImage[]) {
+  return images.map((image) => ({ id: image.id, description: image.description, url: image.url, cached: image.blob !== null }));
+}
+
+function httpUrl(value: unknown, field: string): string {
+  if (typeof value !== "string") throw new Error(`${field} must be a string.`);
+  let url: URL;
+  try {
+    url = new URL(value.trim());
+  } catch {
+    throw new Error(`${field} must be an http or https url.`);
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error(`${field} must be an http or https url.`);
+  return url.href;
+}
+
+function nextImageId(images: readonly BoardImage[]): string {
+  const used = images.map((image) => Number(/^img(\d+)$/.exec(image.id)?.[1] ?? 0));
+  return `img${Math.max(0, ...used) + 1}`;
+}
+
+function imageTools(host: ToolHost, fetchImage: FetchImageFn): ToolDeclaration[] {
+  const encode = host.encodeImage ?? encodeBoardImage;
+  return [
+    {
+      ...IMAGE_TOOL_SPECS[0]!,
+      execute: wrap(host, "whiteboard_add_image", async (input) => {
+        const args = asObject(input);
+        const url = httpUrl(args.url, "url");
+        if (typeof args.description !== "string" || !args.description.trim()) throw new Error("description must be a non-empty string.");
+        const description = args.description.trim().slice(0, IMAGE_DESCRIPTION_LIMIT);
+        const sourceUrl = args.source_url === undefined || args.source_url === "" ? undefined : httpUrl(args.source_url, "source_url");
+        const before = await loadTopic(host);
+        const existing = (before.images ?? []).find((image) => image.url === url);
+        if (existing) return { id: existing.id, ref: `${BOARD_IMAGE_PREFIX}${existing.id}`, cached: existing.blob !== null, existing: true };
+        if ((before.images ?? []).length >= IMAGES_PER_TOPIC) {
+          throw new Error(`This topic already has ${IMAGES_PER_TOPIC} images. Remove one with whiteboard_remove_image first.`);
+        }
+        let encoded: EncodedImage | null = null;
+        let failure: string | null = null;
+        try {
+          encoded = await encode(await fetchImage(url));
+        } catch (error) {
+          failure = error instanceof Error ? error.message : String(error);
+        }
+        // The download can take a while; save onto the topic as it is now.
+        const topic = await loadTopic(host);
+        const images = topic.images ?? [];
+        const image: BoardImage = {
+          id: nextImageId(images),
+          url,
+          description,
+          ...(sourceUrl ? { sourceUrl } : {}),
+          blob: encoded?.blob ?? null,
+          ...(encoded?.blob.type ? { type: encoded.blob.type } : {}),
+          ...(encoded?.width ? { width: encoded.width, height: encoded.height } : {}),
+          addedAt: Date.now(),
+        };
+        topic.images = [...images, image];
+        await saveTopic(host, topic);
+        return {
+          id: image.id,
+          ref: `${BOARD_IMAGE_PREFIX}${image.id}`,
+          cached: image.blob !== null,
+          ...(image.width ? { width: image.width, height: image.height } : {}),
+          ...(failure ? { note: `No copy was saved (${failure}); the board shows the original url, which may stop working.` } : {}),
+        };
+      }),
+    },
+    {
+      ...IMAGE_TOOL_SPECS[1]!,
+      execute: wrap(host, "whiteboard_remove_image", async (input) => {
+        const args = asObject(input);
+        if (typeof args.id !== "string" || !args.id.trim()) throw new Error("id must be a non-empty string.");
+        const id = args.id.trim().replace(BOARD_IMAGE_PREFIX, "");
+        const topic = await loadTopic(host);
+        const images = topic.images ?? [];
+        if (!images.some((image) => image.id === id)) throw new Error(`There is no image ${id}. Saved images: ${images.map((image) => image.id).join(", ") || "none"}.`);
+        topic.images = images.filter((image) => image.id !== id);
+        await saveTopic(host, topic);
+        return { removed: id, images: topic.images.length };
+      }),
+    },
+  ];
 }
 
 function boardTools(host: ToolHost): ToolDeclaration[] {
@@ -299,14 +439,16 @@ function boardTools(host: ToolHost): ToolDeclaration[] {
         const topic = await loadTopic(host);
         if (args.component === "all") {
           const size = BOARD_COMPONENTS.reduce((sum, key) => sum + topic[key].length, 0);
+          const images = topic.images?.length ? { images: imageList(topic.images) } : {};
           if (size > VIEW_ALL_CHAR_LIMIT) {
             return {
               truncated: true,
               lengths: lengths(topic),
+              ...images,
               message: "The sources are too long to return together. Call whiteboard_view for one component.",
             };
           }
-          return sourcesOf(topic);
+          return { ...sourcesOf(topic), ...images };
         }
         if (!isComponent(args.component)) {
           throw new Error(`component must be ${COMPONENT_LIST}, or all.`);

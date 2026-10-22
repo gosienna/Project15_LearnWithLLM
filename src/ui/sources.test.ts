@@ -29,7 +29,7 @@ describe("board source tabs", () => {
     const frame = v.board.querySelector("iframe");
     renderSources(v, content, "debug");
     const tabs = [...v.tabs.querySelectorAll<HTMLButtonElement>(".board-tab")];
-    expect(tabs.map((tab) => tab.firstChild?.textContent)).toEqual(["Preview", "HTML", "CSS", "JS", "SVG", "JSON", "Modules", "Material"]);
+    expect(tabs.map((tab) => tab.firstChild?.textContent)).toEqual(["Preview", "HTML", "CSS", "JS", "SVG", "JSON", "Images", "Modules", "Material"]);
     tabs[2]!.click();
     expect(v.board.hidden).toBe(true);
     expect(v.pane.querySelector(".source-code")?.textContent).toBe("h1 { color: red; }");

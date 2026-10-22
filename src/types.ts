@@ -25,7 +25,28 @@ export interface TopicRecord {
   updatedAt: number;
   /** A whole system prompt pinned in Debug mode. Set, it replaces the one built from the board. */
   systemPrompt?: string;
+  /** Pictures saved with whiteboard_add_image; the page shows them as board-image:ID. Absent on records saved before v3. */
+  images?: BoardImage[];
 }
+
+/** A picture stored with the topic, so the board keeps it when the original link goes away. */
+export interface BoardImage {
+  /** img1, img2, …; the page refers to it as board-image:ID. */
+  id: string;
+  /** Where it was found. */
+  url: string;
+  description: string;
+  /** The page the picture appears on, when the search said. */
+  sourceUrl?: string;
+  /** The cached copy; null when the download failed, and the board uses url instead. */
+  blob: Blob | null;
+  type?: string;
+  width?: number;
+  height?: number;
+  addedAt: number;
+}
+
+export const BOARD_IMAGE_PREFIX = "board-image:";
 
 export interface DialogueMessage {
   id: string;
@@ -189,21 +210,39 @@ export interface SearchResult {
   score: number | null;
 }
 
+/** An image from search with includeImages: Tavily's images, or Google's Images tab. */
+export interface ImageResult {
+  url: string;
+  description?: string;
+  /** The page the image appears on, when known. */
+  sourceUrl?: string;
+  thumbnail?: string;
+  width?: number;
+  height?: number;
+}
+
 /** localLLM.search(): Tavily, or a Google results page when Tavily is not usable. */
 export interface SearchResponse {
   query: string;
   provider: "tavily" | "google";
   results: SearchResult[];
+  /** Only when images were asked for, and only from extensions that support it. */
+  images?: ImageResult[];
   /** Why the Google fallback was used. */
   note?: string;
 }
 
-export type SearchFn = (query: string, maxResults: number) => Promise<SearchResponse>;
+export type SearchFn = (query: string, maxResults: number, includeImages?: boolean) => Promise<SearchResponse>;
+
+/** Download an image found by search, through the extension (pages can't, because of CORS). */
+export type FetchImageFn = (url: string) => Promise<Blob>;
 
 export interface LocalLlmNamespace {
   info(): Promise<LocalLlmInfo>;
   models?: () => Promise<ModelInfo[]>;
   version?: string;
   /** Web search, when the learner allowed it for this site in the extension. Newer extensions only. */
-  search?: (query: string, options?: { maxResults?: number }) => Promise<SearchResponse>;
+  search?: (query: string, options?: { maxResults?: number; includeImages?: boolean }) => Promise<SearchResponse>;
+  /** Download an image returned by search(). Newer extensions only. */
+  fetchImage?: (url: string) => Promise<{ url: string; type: string; blob: Blob }>;
 }

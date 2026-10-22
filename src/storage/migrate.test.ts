@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { migrateTopicRecord } from "./db.ts";
+import { addImagesField, migrateTopicRecord } from "./db.ts";
 
 describe("topic migration", () => {
   it("turns a markdown lesson into stored material plus static html", () => {
@@ -20,5 +20,12 @@ describe("topic migration", () => {
     expect(row.js).toBe("");
     expect(row.svg).toBe("");
     expect(row.json).toBe("");
+  });
+
+  it("adds an empty image list to v2 topics, once", () => {
+    const row: Record<string, unknown> = { id: "t1", html: "<p>x</p>" };
+    expect(addImagesField(row)).toBe(true);
+    expect(row.images).toEqual([]);
+    expect(addImagesField(row)).toBe(false);
   });
 });

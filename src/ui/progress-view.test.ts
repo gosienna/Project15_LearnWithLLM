@@ -43,5 +43,7 @@ describe("toolLabel", () => {
   it("names the web search query", () => {
     expect(toolLabel({ kind: "tool", name: "web_search", input: { query: "mars rover" } })).toBe("Searching the web: mars rover");
     expect(toolLabel({ kind: "tool", name: "web_search", input: "{}" })).toBe("Searching the web");
+    expect(toolLabel({ kind: "tool", name: "whiteboard_add_image", input: { description: "Eiffel Tower" } })).toBe("Saving image: Eiffel Tower");
+    expect(toolLabel({ kind: "tool", name: "whiteboard_add_image", input: {} })).toBe("Saving an image");
   });
 });

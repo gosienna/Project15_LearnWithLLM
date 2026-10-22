@@ -1,5 +1,5 @@
 import { outline, parseLesson, type Section } from "../document/markdown.ts";
-import { BOARD_COMPONENTS, type BoardSources, type SelectionAnchor } from "../types.ts";
+import { BOARD_COMPONENTS, type BoardImage, type BoardSources, type SelectionAnchor } from "../types.ts";
 import { BOARD_MODULES } from "../ui/board-modules.ts";
 import { boardIsEmpty, markSource, SELECTION_END, SELECTION_START } from "../ui/whiteboard.ts";
 
@@ -18,7 +18,13 @@ A stored markdown document exists only after the learner stores the learning mat
 /** Added to the instructions when the ask offers web_search. */
 export const WEB_SEARCH_INSTRUCTIONS = `# Web search
 Call web_search when the question needs current facts, numbers, or names you are not sure of. Search before you write, then teach from what the results say.
-When you use results, end the lesson with a Sources list of <a href="url" target="_blank" rel="noopener">title</a> links. Never invent a url.`;
+When you use results, end the lesson with a Sources list of <a href="url" target="_blank" rel="noopener">title</a> links. Never invent a url.
+When a picture would help, call web_search with include_images true and show an image with <img src="url" alt="what it shows" style="max-width:100%">. Use only image urls from the results, and list the image's page in Sources.`;
+
+/** Added when the ask offers whiteboard_add_image: pictures are saved with the topic, not hotlinked. */
+export const IMAGE_INSTRUCTIONS = `# Images
+Do not put a web_search image url in <img> directly. To show a picture that web_search found, first call whiteboard_add_image with its url and a short description. Then put <img src="board-image:ID" alt="what it shows" style="max-width:100%"> in the html, with the id it returned. Credit the image's page in Sources.
+Use only board-image ids that whiteboard_add_image returned or that the whiteboard lists below.`;
 
 export const EMPTY_BOARD_LINE = "The whiteboard is empty.";
 
@@ -42,6 +48,10 @@ export interface BuildPromptOptions {
   systemOverride?: string;
   /** The ask offers web_search. */
   webSearch?: boolean;
+  /** The ask offers whiteboard_add_image. */
+  imageTools?: boolean;
+  /** The topic's saved images, listed in the board status. */
+  images?: readonly Pick<BoardImage, "id" | "description">[];
 }
 
 export interface BuiltPrompt {
@@ -50,13 +60,17 @@ export interface BuiltPrompt {
   prompt: string;
 }
 
-export function boardStatus(sources: BoardSources): string {
-  if (boardIsEmpty(sources)) return EMPTY_BOARD_LINE;
-  return BOARD_COMPONENTS.map((key) => `${key}: ${sources[key].length} characters`).join(", ") + ".";
+export function boardStatus(sources: BoardSources, images: readonly Pick<BoardImage, "id" | "description">[] = []): string {
+  const pictures = images.length
+    ? `\nImages: ${images.map((image) => `${image.id} (${image.description})`).join(", ")}.`
+    : "";
+  if (boardIsEmpty(sources)) return `${EMPTY_BOARD_LINE}${pictures}`;
+  return BOARD_COMPONENTS.map((key) => `${key}: ${sources[key].length} characters`).join(", ") + "." + pictures;
 }
 
-export function whiteboardPreface(status: string, includeMaterial: boolean, webSearch = false): string {
-  let text = `${INSTRUCTIONS}\n\n${webSearch ? `${WEB_SEARCH_INSTRUCTIONS}\n\n` : ""}# Whiteboard\n${status}\n`;
+export function whiteboardPreface(status: string, includeMaterial: boolean, webSearch = false, imageTools = false): string {
+  const extra = `${webSearch ? `${WEB_SEARCH_INSTRUCTIONS}\n\n` : ""}${imageTools ? `${IMAGE_INSTRUCTIONS}\n\n` : ""}`;
+  let text = `${INSTRUCTIONS}\n\n${extra}# Whiteboard\n${status}\n`;
   if (includeMaterial) text += `\n# Stored learning material\n`;
   return text;
 }
@@ -111,7 +125,12 @@ export function fitLesson(markdown: string, tokenBudget: number, maxFullSections
 
 function automaticSystem(options: BuildPromptOptions, budget: number): string {
   const materialMarkdown = options.materialMarkdown.trim();
-  const header = whiteboardPreface(boardStatus(options.sources), materialMarkdown.length > 0, options.webSearch === true);
+  const header = whiteboardPreface(
+    boardStatus(options.sources, options.images),
+    materialMarkdown.length > 0,
+    options.webSearch === true,
+    options.imageTools === true,
+  );
   const lessonBudget = Math.max(64, budget - estimateTokens(header));
   const material = materialMarkdown ? fitLesson(options.materialMarkdown, lessonBudget, options.maxFullSections) : "";
   return `${header}${material}`;
@@ -159,10 +178,14 @@ export function selectionPrompt(sources: BoardSources, anchor: SelectionAnchor, 
   return `${head}\n\n${intro}\n${source}\n\n${tail}`;
 }
 
+function without(text: string, block: string): string {
+  return text.split(`${block}\n\n`).join("").split(block).join("");
+}
+
 /** A pinned system prompt follows the Web search switch: the instructions are dropped, then added back while it is on. */
-export function pinnedSystem(text: string, webSearch: boolean): string {
-  const base = text.split(`${WEB_SEARCH_INSTRUCTIONS}\n\n`).join("").split(WEB_SEARCH_INSTRUCTIONS).join("").trimEnd();
-  return webSearch ? `${base}\n\n${WEB_SEARCH_INSTRUCTIONS}` : base;
+export function pinnedSystem(text: string, webSearch: boolean, imageTools = false): string {
+  const base = without(without(text, WEB_SEARCH_INSTRUCTIONS), IMAGE_INSTRUCTIONS).trimEnd();
+  return `${base}${webSearch ? `\n\n${WEB_SEARCH_INSTRUCTIONS}` : ""}${imageTools ? `\n\n${IMAGE_INSTRUCTIONS}` : ""}`;
 }
 
 export function buildPrompt(options: BuildPromptOptions): BuiltPrompt {
@@ -172,7 +195,7 @@ export function buildPrompt(options: BuildPromptOptions): BuiltPrompt {
   const system =
     options.systemOverride === undefined
       ? automaticSystem(options, budget)
-      : pinnedSystem(options.systemOverride, options.webSearch === true);
+      : pinnedSystem(options.systemOverride, options.webSearch === true, options.imageTools === true);
   const anchor = options.anchor;
   if (!anchor || boardIsEmpty(options.sources)) return { system, prompt: options.question };
   const remaining = Math.max(256, budget - estimateTokens(system));

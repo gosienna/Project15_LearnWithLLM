@@ -133,11 +133,23 @@ function escapeScriptClose(js: string): string {
   return js.replace(/<\/script/gi, "<\\/script");
 }
 
-export function assembleBoardDocument(sources: BoardSources): string {
-  const svg = sources.svg.trim()
-    ? `<div id="lesson-svg">${sources.svg}</div>\n`
+/** What each stored image shows as in the frame, by id: a data: URL of the cached copy, or its original url. */
+export type BoardImageSources = Record<string, string>;
+
+const BOARD_IMAGE_REF = /board-image:([A-Za-z0-9_-]+)/g;
+
+/** Swap board-image:ID for the image's src. Unknown ids stay as they are, so the slip is visible. */
+export function resolveBoardImages(source: string, images: BoardImageSources): string {
+  return source.replace(BOARD_IMAGE_REF, (ref, id: string) => (Object.hasOwn(images, id) ? images[id]! : ref));
+}
+
+export function assembleBoardDocument(sources: BoardSources, images: BoardImageSources = {}): string {
+  const svgSource = resolveBoardImages(sources.svg, images);
+  const svg = svgSource.trim()
+    ? `<div id="lesson-svg">${svgSource}</div>\n`
     : "";
-  const data = escapeScriptClose(`globalThis.lessonData = ${lessonDataLiteral(sources.json)};`);
+  const imagesLiteral = JSON.stringify(images).replaceAll("<", "\\u003c").replaceAll("\u2028", "\\u2028").replaceAll("\u2029", "\\u2029");
+  const data = escapeScriptClose(`globalThis.lessonData = ${lessonDataLiteral(sources.json)};\nglobalThis.lessonImages = ${imagesLiteral};`);
   // Prefilled modules: their style comes before the lesson css so the lesson can override it.
   const moduleStyles = BOARD_MODULES.map((module) => `<style>${escapeStyleClose(module.style)}</style>\n`).join("");
   const moduleScripts = BOARD_MODULES.map(
@@ -150,11 +162,11 @@ export function assembleBoardDocument(sources: BoardSources): string {
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="${FRAME_CSP}">
 ${moduleStyles}<style>
-${escapeStyleClose(sources.css)}
+${escapeStyleClose(resolveBoardImages(sources.css, images))}
 </style>
 </head>
 <body>
-${svg}${sources.html}
+${svg}${resolveBoardImages(sources.html, images)}
 <script>${data}</script>
 ${moduleScripts}<script>${SELECTION_BRIDGE}</script>
 <script>
@@ -349,8 +361,9 @@ const rendered = new WeakMap<HTMLElement, string>();
 const handlersFor = new WeakMap<HTMLElement, BoardHandlers>();
 const listening = new WeakSet<HTMLElement>();
 
-function renderKey(sources: BoardSources): string {
-  return BOARD_COMPONENTS.map((key) => sources[key]).join("\0");
+function renderKey(sources: BoardSources, images: BoardImageSources): string {
+  const pictures = Object.entries(images).map(([id, src]) => `${id}:${src.length}:${src.slice(0, 64)}`);
+  return [...BOARD_COMPONENTS.map((key) => sources[key]), ...pictures].join("\0");
 }
 
 function text(value: unknown, limit: number): string | null {
@@ -467,10 +480,10 @@ export function focusStart(host: HTMLElement): void {
   if (field && !field.disabled) field.focus();
 }
 
-export function renderWhiteboard(host: HTMLElement, sources: BoardSources, handlers?: BoardHandlers): void {
+export function renderWhiteboard(host: HTMLElement, sources: BoardSources, handlers?: BoardHandlers, images: BoardImageSources = {}): void {
   if (handlers) handlersFor.set(host, handlers);
   listen(host);
-  const key = renderKey(sources);
+  const key = renderKey(sources, images);
   if (rendered.get(host) === key && host.childElementCount > 0) return;
   rendered.set(host, key);
   host.replaceChildren();
@@ -484,6 +497,6 @@ export function renderWhiteboard(host: HTMLElement, sources: BoardSources, handl
   // Popups let Sources links open in a new tab; the frame still gets no same-origin access.
   frame.setAttribute("sandbox", "allow-scripts allow-popups allow-popups-to-escape-sandbox");
   frame.referrerPolicy = "no-referrer";
-  frame.srcdoc = assembleBoardDocument(sources);
+  frame.srcdoc = assembleBoardDocument(sources, images);
   host.append(frame);
 }

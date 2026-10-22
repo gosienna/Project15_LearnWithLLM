@@ -4,6 +4,7 @@ import type {
   CreateOptions,
   LanguageModelAPI,
   LanguageModelSession,
+  FetchImageFn,
   PromptMessage,
   SearchFn,
   SelectionAnchor,
@@ -100,6 +101,8 @@ export interface TutorDeps {
   modelId?: () => string | null;
   /** The search function when web search is on and the extension offers it; otherwise null. */
   search?: () => SearchFn | null;
+  /** Downloads an image for the topic when web search is on and the extension offers it; otherwise null. */
+  fetchImage?: () => FetchImageFn | null;
 }
 
 export interface AskOptions {
@@ -209,6 +212,8 @@ export class Tutor {
   private build(topic: TopicRecord, question: string, anchor: SelectionAnchor | null, maxFullSections?: number): BuiltPrompt {
     return buildPrompt({
       webSearch: !!this.deps.search?.(),
+      imageTools: !!this.deps.fetchImage?.(),
+      images: topic.images ?? [],
       sources: sourcesOf(topic),
       materialMarkdown: topic.materialMarkdown,
       question,
@@ -307,6 +312,7 @@ export class Tutor {
         report();
       },
       search: this.deps.search?.() ?? undefined,
+      fetchImage: this.deps.fetchImage?.() ?? undefined,
     });
 
     let reply = "";

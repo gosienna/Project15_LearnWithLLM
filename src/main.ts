@@ -1,8 +1,9 @@
-import { loadBackendStatus, readSavedModelId, searchAvailable, writeSavedModelId, type BackendStatus, type BackendWindow } from "./llm/backend.ts";
+import { fetchImageAvailable, loadBackendStatus, readSavedModelId, searchAvailable, writeSavedModelId, type BackendStatus, type BackendWindow } from "./llm/backend.ts";
 import { toolSpecs } from "./llm/tools.ts";
 import { Tutor } from "./llm/turn.ts";
+import { boardImageSources } from "./storage/board-images.ts";
 import { createEmptyTopic, createRepository, openDatabase, type TopicRepository } from "./storage/db.ts";
-import type { SearchFn, SelectionAnchor, TopicRecord, TurnTrace } from "./types.ts";
+import type { BoardSources, FetchImageFn, SearchFn, SelectionAnchor, TopicRecord, TurnTrace } from "./types.ts";
 import { renderAskPopover, type AskPopover } from "./ui/ask-popover.ts";
 import { renderExplainPopover, type ExplainPopover } from "./ui/explain-popover.ts";
 import { createProgressView, progressLine, type ProgressView } from "./ui/progress-view.ts";
@@ -19,6 +20,7 @@ import {
   focusStart,
   renderWhiteboard,
   syncStartForm,
+  type BoardImageSources,
 } from "./ui/whiteboard.ts";
 import "./styles.css";
 
@@ -43,6 +45,8 @@ interface AppController {
   liveTraceId: string | null;
   /** Listeners for the Next request tab: the question or the selection changed. */
   draftListeners: Set<() => void>;
+  /** The open topic's images as the board shows them, once read; painting starts from these. */
+  imageSources: { topicId: string; map: BoardImageSources } | null;
 }
 
 function activeTopic(app: AppController): TopicRecord | undefined {
@@ -56,7 +60,14 @@ export const STORE_MATERIAL_PROMPT =
 function activeSearch(app: AppController): SearchFn | null {
   const win = window as unknown as BackendWindow;
   if (!app.webSearch || !searchAvailable(win)) return null;
-  return (query, maxResults) => win.localLLM!.search!(query, { maxResults });
+  return (query, maxResults, includeImages) => win.localLLM!.search!(query, { maxResults, includeImages });
+}
+
+/** localLLM.fetchImage, when web search is on and the extension offers it. */
+function activeFetchImage(app: AppController): FetchImageFn | null {
+  const win = window as unknown as BackendWindow;
+  if (!activeSearch(app) || !fetchImageAvailable(win)) return null;
+  return async (url) => (await win.localLLM!.fetchImage!(url)).blob;
 }
 
 function syncControls(app: AppController): void {
@@ -103,19 +114,38 @@ function paint(app: AppController): void {
     svg: topic?.svg ?? "",
     json: topic?.json ?? "",
   };
-  renderWhiteboard(app.shell.board, sources, {
-    onStart: (question) => void ask(app, question, null),
-    onSelection: (anchor) => onSelection(app, anchor),
-    onDraft: () => notifyDraft(app),
-  });
+  paintBoard(app, topic, sources);
   renderSources(
     { tabs: app.shell.boardTabs, board: app.shell.boardArea, pane: app.shell.sources },
-    { ...sources, material: topic?.materialMarkdown ?? "" },
+    { ...sources, material: topic?.materialMarkdown ?? "", images: topic?.images ?? [] },
     app.mode,
     topic ? promptInputs(app, topic) : undefined,
   );
   placeProgress(app);
   syncControls(app);
+}
+
+/**
+ * Draw the board with the images read so far (a new one shows from its url), then again once every
+ * cached copy is a data: URL. renderWhiteboard skips the second draw when nothing changed.
+ */
+function paintBoard(app: AppController, topic: TopicRecord | undefined, sources: BoardSources): void {
+  const handlers = {
+    onStart: (question: string) => void ask(app, question, null),
+    onSelection: (anchor: SelectionAnchor | null) => onSelection(app, anchor),
+    onDraft: () => notifyDraft(app),
+  };
+  const images = topic?.images ?? [];
+  const known = topic && app.imageSources?.topicId === topic.id ? app.imageSources.map : {};
+  const first: BoardImageSources = {};
+  for (const image of images) first[image.id] = known[image.id] ?? image.url;
+  renderWhiteboard(app.shell.board, sources, handlers, first);
+  if (!topic || images.length === 0) return;
+  void boardImageSources(topic.id, images).then((map) => {
+    if (app.activeId !== topic.id || activeTopic(app)?.images !== images) return;
+    app.imageSources = { topicId: topic.id, map };
+    renderWhiteboard(app.shell.board, sources, handlers, map);
+  });
 }
 
 /** Under the start form while the first lesson is written; otherwise floating over the board. */
@@ -152,7 +182,7 @@ function promptInputs(app: AppController, topic: TopicRecord): PromptInputs {
   return {
     topicId: topic.id,
     system: () => app.tutor.previewSystem(topic),
-    request: () => ({ ...app.tutor.previewRequest(topic), tools: toolSpecs(activeSearch(app) !== null) }),
+    request: () => ({ ...app.tutor.previewRequest(topic), tools: toolSpecs(activeSearch(app) !== null, activeFetchImage(app) !== null) }),
     prompt: () => app.tutor.previewPrompt(topic, pendingQuestion(app), app.popover.anchor()),
     selection: () => app.popover.anchor(),
     subscribePrompt: (listener) => {
@@ -323,6 +353,7 @@ export async function boot(root: HTMLElement): Promise<void> {
     traces: [],
     liveTraceId: null,
     draftListeners: new Set(),
+    imageSources: null,
   };
   applyMode(shell, app.mode);
   shell.webSearch.addEventListener("click", () => {
@@ -345,6 +376,7 @@ export async function boot(root: HTMLElement): Promise<void> {
     languageModel: () => app.status.model,
     modelId: () => app.status.chosen?.id ?? null,
     search: () => activeSearch(app),
+    fetchImage: () => activeFetchImage(app),
     contextTokens: () => app.status.chosen?.inputQuota,
     getOpenTopicId: () => app.activeId,
     onTopic: (topic) => {

@@ -2,7 +2,7 @@ import { markdownToStaticHtml } from "../document/static-html.ts";
 import type { TopicRecord } from "../types.ts";
 
 const DB_NAME = "learn-with-llm";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORE = "topics";
 
 export function migrateTopicRecord(row: Record<string, unknown>): boolean {
@@ -15,6 +15,13 @@ export function migrateTopicRecord(row: Record<string, unknown>): boolean {
   row.svg = "";
   row.json = "";
   delete row.documentMarkdown;
+  return true;
+}
+
+/** v3: topics keep saved images. */
+export function addImagesField(row: Record<string, unknown>): boolean {
+  if (Array.isArray(row.images)) return false;
+  row.images = [];
   return true;
 }
 
@@ -43,7 +50,7 @@ export function openDatabase(): Promise<IDBDatabase> {
         store.createIndex("byUpdated", "updatedAt");
       }
       const oldVersion = (event as IDBVersionChangeEvent).oldVersion;
-      if (oldVersion >= 2) return;
+      if (oldVersion === 0 || oldVersion >= 3) return;
       const tx = request.transaction;
       if (!tx) return;
       const cursorRequest = tx.objectStore(STORE).openCursor();
@@ -51,7 +58,8 @@ export function openDatabase(): Promise<IDBDatabase> {
         const cursor = cursorRequest.result;
         if (!cursor) return;
         const row = cursor.value as Record<string, unknown>;
-        if (migrateTopicRecord(row)) cursor.update(row);
+        const changed = oldVersion < 2 && migrateTopicRecord(row);
+        if (addImagesField(row) || changed) cursor.update(row);
         cursor.continue();
       };
     };
@@ -103,6 +111,7 @@ export function createEmptyTopic(now = Date.now()): TopicRecord {
     json: "",
     materialMarkdown: "",
     messages: [],
+    images: [],
     createdAt: now,
     updatedAt: now,
   };
