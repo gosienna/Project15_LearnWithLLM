@@ -157,11 +157,20 @@ export function selectionPrompt(sources: BoardSources, anchor: SelectionAnchor, 
   return `${head}\n\n${intro}\n${source}\n\n${tail}`;
 }
 
+/** A pinned system prompt follows the Web search switch: the instructions are dropped, then added back while it is on. */
+export function pinnedSystem(text: string, webSearch: boolean): string {
+  const base = text.split(`${WEB_SEARCH_INSTRUCTIONS}\n\n`).join("").split(WEB_SEARCH_INSTRUCTIONS).join("").trimEnd();
+  return webSearch ? `${base}\n\n${WEB_SEARCH_INSTRUCTIONS}` : base;
+}
+
 export function buildPrompt(options: BuildPromptOptions): BuiltPrompt {
   const contextTokens = options.contextTokens ?? 8192;
   const reservedTokens = options.reservedTokens ?? 1500;
   const budget = Math.max(256, contextTokens - reservedTokens);
-  const system = options.systemOverride ?? automaticSystem(options, budget);
+  const system =
+    options.systemOverride === undefined
+      ? automaticSystem(options, budget)
+      : pinnedSystem(options.systemOverride, options.webSearch === true);
   const anchor = options.anchor;
   if (!anchor || boardIsEmpty(options.sources)) return { system, prompt: options.question };
   const remaining = Math.max(256, budget - estimateTokens(system));

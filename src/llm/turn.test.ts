@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createEmptyTopic, type TopicRepository } from "../storage/db.ts";
 import type { CreateOptions, LanguageModelAPI, LanguageModelSession, SelectionAnchor, TopicRecord, TurnTrace } from "../types.ts";
 import {
+  errorNote,
   extractBoardSvg,
   NOTHING_CHANGED,
   shouldUseEmptyBoardFallback,
@@ -130,6 +131,60 @@ const anchor: SelectionAnchor = {
   rect: { x: 0, y: 0, width: 10, height: 10 },
 };
 
+describe("fitting a lesson to the model quota", () => {
+  it("cuts the prompt until Gemini's session accepts it", async () => {
+    const topic = {
+      ...createEmptyTopic(11),
+      materialMarkdown: ["# Cells", ...Array.from({ length: 6 }, (_, n) => `## Part ${n}\n\n${"mitochondria ".repeat(400)}`)].join("\n\n"),
+    };
+    const creates: CreateOptions[] = [];
+    const model: LanguageModelAPI = {
+      async availability() {
+        return "available";
+      },
+      async create(options) {
+        creates.push(options ?? {});
+        const system = options?.initialPrompts?.[0]?.content ?? "";
+        if (system.length > 8000) throw Object.assign(new Error("Initial prompts exceed the context window"), { name: "QuotaExceededError" });
+        return {
+          inputQuota: 2500,
+          async measureInputUsage(input: string) {
+            return Math.ceil(input.length / 4);
+          },
+          promptStreaming() {
+            return (async function* () {
+              yield "On the board.";
+            })();
+          },
+          destroy() {},
+        };
+      },
+    };
+    const { tutor, errors } = tutorFor(topic, model, { contextTokens: () => 1_048_576, modelId: () => "gemini:gemini-3.8-flash" });
+
+    await tutor.ask(topic.id, "Teach me cells");
+
+    expect(errors.some((message) => message?.includes("over the model's limit"))).toBe(false);
+    const system = creates.at(-1)?.initialPrompts?.[0]?.content ?? "";
+    expect(Math.ceil(`${system}\nTeach me cells`.length / 4)).toBeLessThanOrEqual(1000);
+    expect(creates.length).toBeGreaterThan(1);
+  });
+});
+
+describe("errorNote", () => {
+  it("shows the provider's message for a rate limit, even from a cut-off body", () => {
+    const body = '{ "error": { "code": 429, "message": "You exceeded your current quota, please check your plan.\\n* Quota ex';
+    const note = errorNote({ name: "QuotaExceededError", message: `Provider rate limit or quota exceeded: ${body}` });
+    expect(note).toBe("The provider's rate limit or quota is used up: You exceeded your current quota, please check your plan. * Quota ex");
+  });
+
+  it("keeps the lesson-size note for quota errors that are not from the provider", () => {
+    expect(errorNote({ name: "QuotaExceededError", message: "The lesson is over the model's limit." })).toBe(
+      "The lesson or the conversation is over the model's limit. Shorten the request.",
+    );
+  });
+});
+
 describe("unfence", () => {
   it("takes the code out of a fenced reply and leaves other text alone", () => {
     expect(unfence("```html\n<h1>Hi</h1>\n```")).toBe("<h1>Hi</h1>");
@@ -170,6 +225,21 @@ describe("tutor", () => {
     expect(creates[0]?.initialPrompts?.[0]?.content).toContain("# Web search");
     expect(creates[1]?.tools?.some((tool) => tool.name === "web_search")).toBe(false);
     expect(creates[1]?.initialPrompts?.[0]?.content).not.toContain("# Web search");
+  });
+
+  it("records the offered tool names in the trace", async () => {
+    const topic = createEmptyTopic(1);
+    const { model } = scriptedModel(async function* () {
+      yield "done";
+    });
+    const { tutor, traces } = tutorFor(topic, model, {
+      search: () => async (query) => ({ query, provider: "tavily", results: [] }),
+    });
+
+    await tutor.ask(topic.id, "What is new?");
+
+    expect(traces.at(-1)?.trace.request?.tools).toContain("web_search");
+    expect(traces.at(-1)?.trace.request?.tools).toContain("whiteboard_set");
   });
 
   it("creates a new session with only a system prompt for every ask and saves only the board", async () => {
@@ -446,7 +516,7 @@ describe("tutor", () => {
     expect(tutor.previewRequest(topic)).toEqual({ edited: true, initialPrompts: edited });
     await tutor.ask(topic.id, "Two");
     expect(creates[1]?.initialPrompts).toEqual(edited);
-    expect(traces.at(-1)?.trace.request).toEqual({ initialPrompts: edited, prompt: "Two", edited: true });
+    expect(traces.at(-1)?.trace.request).toMatchObject({ initialPrompts: edited, prompt: "Two", edited: true });
 
     await tutor.ask(topic.id, "Three");
     expect(creates[2]?.initialPrompts).toEqual([{ role: "system", content: "Pinned instructions." }]);

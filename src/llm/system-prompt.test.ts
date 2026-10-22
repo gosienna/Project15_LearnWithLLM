@@ -125,4 +125,13 @@ describe("web search instructions", () => {
     expect(whiteboardPreface("The whiteboard is empty.", false, true)).toContain(`${INSTRUCTIONS}\n\n${WEB_SEARCH_INSTRUCTIONS}\n\n# Whiteboard`);
     expect(whiteboardPreface("The whiteboard is empty.", false)).not.toContain("# Web search");
   });
+
+  it("follow the switch in a pinned system prompt", () => {
+    const base = { sources: emptyBoard(), materialMarkdown: "", question: "Q", systemOverride: "You are a pirate tutor." };
+    expect(buildPrompt({ ...base, webSearch: true }).system).toBe(`You are a pirate tutor.\n\n${WEB_SEARCH_INSTRUCTIONS}`);
+    expect(buildPrompt({ ...base, webSearch: false }).system).toBe("You are a pirate tutor.");
+    const copied = whiteboardPreface("The whiteboard is empty.", false, true);
+    expect(buildPrompt({ ...base, systemOverride: copied, webSearch: false }).system).not.toContain("# Web search");
+    expect(buildPrompt({ ...base, systemOverride: copied, webSearch: true }).system.split("# Web search")).toHaveLength(2);
+  });
 });

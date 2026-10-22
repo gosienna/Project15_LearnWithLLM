@@ -63,6 +63,8 @@ export interface RequestInput {
   /** The messages the session was created with: the system prompt, or an edited list. */
   initialPrompts: PromptMessage[];
   prompt: string;
+  /** The names of the tools the session was created with. Absent in records from before they were kept. */
+  tools?: string[];
   selection?: SelectionAnchor;
   /** The initial prompts came from the Debug editor instead of the topic. */
   edited?: boolean;

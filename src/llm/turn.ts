@@ -12,7 +12,7 @@ import type {
   TurnTrace,
 } from "../types.ts";
 import { boardIsEmpty, insertNote, stripSelectionMarkers, titleFromHtml } from "../ui/whiteboard.ts";
-import { buildPrompt, estimateTokens, type BuiltPrompt } from "./system-prompt.ts";
+import { buildPrompt, type BuiltPrompt } from "./system-prompt.ts";
 import { createWhiteboardTools } from "./tools.ts";
 import { capText, TraceRecorder } from "./trace.ts";
 
@@ -50,12 +50,26 @@ export function shouldUseEmptyBoardFallback(input: {
   return /<[a-z][^>\n]*>/i.test(input.reply);
 }
 
+/**
+ * The cloud provider's own explanation from a backend error ("Provider ...: <body>"), or null.
+ * The backend cuts the body at 300 characters, often mid-JSON, so "message" is matched, not parsed.
+ */
+export function providerDetail(message: string | undefined): string | null {
+  if (!message?.startsWith("Provider ")) return null;
+  const inner = /"message"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(message)?.[1];
+  const text = inner ? inner.replace(/\\n/g, " ").replace(/\\(.)/g, "$1") : message;
+  return text.replace(/\s+/g, " ").trim() || null;
+}
+
 export function errorNote(error: unknown): string | null {
   const err = error as { name?: string; message?: string };
+  const detail = providerDetail(err?.message);
   switch (err?.name) {
     case "NotAllowedError":
+      if (detail) return `The provider rejected the API key: ${detail}`;
       return "This site is not allowed to use the model. Enable it in the extension and reload.";
     case "QuotaExceededError":
+      if (detail) return `The provider's rate limit or quota is used up: ${detail}`;
       return "The lesson or the conversation is over the model's limit. Shorten the request.";
     case "InvalidStateError":
       return "The session was lost. Ask again.";
@@ -63,6 +77,7 @@ export function errorNote(error: unknown): string | null {
       return null;
     case "NetworkError":
     case "OperationError":
+      if (detail) return `The request failed: ${detail}`;
       return "The request failed. Ask again.";
     default:
       return err?.message || "The request failed.";
@@ -307,6 +322,7 @@ export class Tutor {
       recorder.trace.request = {
         initialPrompts: created.initialPrompts.map((message) => ({ ...message, content: capText(message.content) })),
         prompt: capText(created.prompt),
+        tools: tools.map((tool) => tool.name),
         ...(anchor ? { selection: anchor } : {}),
         ...(edited ? { edited: true } : {}),
       };
@@ -428,22 +444,33 @@ export class Tutor {
     alive: () => boolean,
   ): Promise<{ session: LanguageModelSession; initialPrompts: PromptMessage[]; prompt: string }> {
     let maxFullSections: number | undefined;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
+    let clipChars: number | undefined;
+    for (let attempt = 0; attempt < 12; attempt += 1) {
       if (!alive()) throw Object.assign(new Error("Aborted"), { name: "AbortError" });
       const built = this.build(topic, question, anchor, maxFullSections);
-      const initialPrompts: PromptMessage[] = [{ role: "system", content: built.system }];
-      const session = await createSession(model, {
-        ...this.options(tools, signal, initialPrompts),
-        monitor: (monitor) => {
-          monitor.addEventListener("downloadprogress", (event) => {
-            const loaded = (event as Event & { loaded?: number }).loaded;
-            if (typeof loaded === "number") this.deps.onDownload(loaded);
-          });
-        },
-      }, signal);
-      const result = { session, initialPrompts, prompt: built.prompt };
+      const system = clipChars === undefined ? built.system : clipText(built.system, clipChars);
+      const prompt = clipChars === undefined ? built.prompt : clipText(built.prompt, Math.max(256, Math.floor(clipChars / 4)));
+      const initialPrompts: PromptMessage[] = [{ role: "system", content: system }];
+      let session: LanguageModelSession;
+      try {
+        session = await createSession(model, {
+          ...this.options(tools, signal, initialPrompts),
+          monitor: (monitor) => {
+            monitor.addEventListener("downloadprogress", (event) => {
+              const loaded = (event as Event & { loaded?: number }).loaded;
+              if (typeof loaded === "number") this.deps.onDownload(loaded);
+            });
+          },
+        }, signal);
+      } catch (error) {
+        if ((error as { name?: string }).name !== "QuotaExceededError") throw error;
+        maxFullSections = halveSections(maxFullSections, topic.materialMarkdown);
+        clipChars = Math.floor((clipChars ?? system.length) / 2);
+        continue;
+      }
+      const result = { session, initialPrompts, prompt };
       if (!session.measureInputUsage) return result;
-      const assembled = `${built.system}\n${built.prompt}`;
+      const assembled = `${system}\n${prompt}`;
       const measured = await settleWithin(session.measureInputUsage(assembled), signal, START_TIMEOUT_MS, START_TIMEOUT).catch(
         (error: unknown) => {
           session.destroy();
@@ -451,19 +478,28 @@ export class Tutor {
         },
       );
       const quota = session.inputQuota ?? this.deps.contextTokens?.() ?? 8192;
-      const limit = Math.max(1, quota - 1500);
+      // Leave room for the reply. Gemini 3.8 Flash accepts 1,048,576 input tokens; the session quota is that cap, or the user's, whichever is smaller.
+      const limit = Math.max(256, quota - 1500);
       if (measured <= limit) return result;
-
-      const currentCap = maxFullSections ?? parseLesson(topic.materialMarkdown).sections.length;
-      // Nothing left to cut: send it and let the model report the quota.
-      if (currentCap <= 0) return result;
       session.destroy();
-      maxFullSections = Math.floor(currentCap / 2);
-      if (estimateTokens(assembled) <= limit) maxFullSections = Math.max(0, maxFullSections - 1);
+      maxFullSections = halveSections(maxFullSections, topic.materialMarkdown);
+      const ratio = limit / Math.max(measured, 1);
+      clipChars = Math.max(256, Math.floor((clipChars ?? system.length) * ratio));
     }
 
     throw Object.assign(new Error("The lesson is over the model's limit."), { name: "QuotaExceededError" });
   }
+}
+
+function halveSections(maxFullSections: number | undefined, markdown: string): number {
+  const current = maxFullSections ?? parseLesson(markdown).sections.length;
+  return Math.floor(current / 2);
+}
+
+function clipText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const note = "\n\n[truncated to fit the context window]";
+  return `${text.slice(0, Math.max(0, maxChars - note.length))}${note}`;
 }
 
 export type { CreateOptions };

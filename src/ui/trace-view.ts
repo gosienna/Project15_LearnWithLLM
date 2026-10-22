@@ -89,6 +89,12 @@ function requestView(request: RequestInput, key: string, openKeys: Set<string>):
   label.className = "trace-field";
   label.textContent = "prompt";
   details.append(label, codeBlock(request.prompt));
+  if (request.tools) {
+    const tools = document.createElement("p");
+    tools.className = "trace-field";
+    tools.textContent = `tools · ${request.tools.length}`;
+    details.append(tools, codeBlock(request.tools.join("\n")));
+  }
   if (request.selection) details.append(valueView("selection", request.selection));
   return details;
 }
