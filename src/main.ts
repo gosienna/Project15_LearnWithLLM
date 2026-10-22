@@ -1,4 +1,5 @@
 import { fetchImageAvailable, loadBackendStatus, readSavedModelId, searchAvailable, writeSavedModelId, type BackendStatus, type BackendWindow } from "./llm/backend.ts";
+import { directModelId, readDirectConfig, writeDirectConfig } from "./llm/direct.ts";
 import { toolSpecs } from "./llm/tools.ts";
 import { Tutor } from "./llm/turn.ts";
 import { boardImageSources } from "./storage/board-images.ts";
@@ -291,7 +292,7 @@ export const SERVICE_CLOSED = "Model service closed after being idle. Your next 
 export const SERVICE_UNRESPONSIVE = "The model service stopped answering. Reload the page.";
 
 async function refreshStatus(app: AppController): Promise<void> {
-  app.status = await loadBackendStatus(window, readSavedModelId());
+  app.status = await loadBackendStatus(window, readSavedModelId(), readDirectConfig());
   syncControls(app);
 }
 
@@ -309,14 +310,22 @@ export async function boot(root: HTMLElement): Promise<void> {
     void app.tutor.ask(app.activeId, STORE_MATERIAL_PROMPT, { note: false });
   });
   shell.stop.addEventListener("click", () => app.tutor.stop());
-  const system = renderSystemPanel((id) => {
-    writeSavedModelId(id);
-    void refreshStatus(app);
+  const openSystem = () => {
+    system.open(app.status.models, app.status.chosen?.id ?? null, app.status.modelNote, readDirectConfig());
+  };
+  const system = renderSystemPanel({
+    onChoose: (id) => {
+      writeSavedModelId(id);
+      void refreshStatus(app);
+    },
+    onSaveKey: (config) => {
+      writeDirectConfig(config);
+      if (config) writeSavedModelId(directModelId(config));
+      void refreshStatus(app).then(openSystem);
+    },
   });
   shell.systemButton.addEventListener("click", () => {
-    void refreshStatus(app).then(() => {
-      system.open(app.status.models, app.status.chosen?.id ?? null, app.status.modelNote);
-    });
+    void refreshStatus(app).then(openSystem);
   });
 
   const repo = createRepository(await openDatabase());

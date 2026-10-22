@@ -1047,3 +1047,41 @@ button { cursor: pointer; }
 
   .topics.is-open { display: flex; }
 }
+
+.system-key { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+
+.system-field { display: flex; flex-direction: column; gap: 4px; font-size: 0.9rem; }
+
+.system-field input, .system-field select {
+  font: inherit;
+  width: 100%;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--ink);
+}
+
+.system-row { display: flex; gap: 8px; align-items: center; }
+
+.system-row input { flex: 1; }
+
+.system-check { display: flex; gap: 6px; align-items: center; font-size: 0.9rem; }
+
+.system-note { margin: 0; font-size: 0.85rem; color: var(--muted); }
+
+.system-note:empty { display: none; }
+
+.system-small, .system-primary {
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink);
+  padding: 6px 12px;
+}
+
+.system-primary { border-color: var(--accent); background: var(--accent); color: var(--accent-ink); }
+
+.system-small:disabled { opacity: 0.5; cursor: default; }

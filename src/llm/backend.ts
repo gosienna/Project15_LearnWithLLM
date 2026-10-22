@@ -1,9 +1,10 @@
 import type { Availability, LanguageModelAPI, LocalLlmNamespace, ModelInfo } from "../types.ts";
+import { createDirectLanguageModel, directModelInfo, isDirectModelId, type DirectConfig } from "./direct.ts";
 
 export const MODEL_HEADER = "Language model";
 export const MODEL_STORAGE_KEY = "learn-with-llm.model";
 
-export const MISSING_MODEL = "The page cannot see a model. Enable this site in the extension and reload.";
+export const MISSING_MODEL = "The page cannot see a model. Add your API key under System, or enable this site in the extension and reload.";
 
 export const BLOCKED_MODEL = "This site is not allowed to use the model. Enable it in the extension and reload.";
 
@@ -149,12 +150,33 @@ function statusDetail(chosen: ModelInfo | null, availabilityText: string): strin
   return where ? `${where} · ${availabilityText}` : availabilityText;
 }
 
-export async function loadBackendStatus(win: BackendWindow, savedId: string | null = null): Promise<BackendStatus> {
-  const model = await waitForLanguageModel(win);
-  const listing = await listAvailableModels(win);
-  const models = listing.models;
+/**
+ * The typed-in API key is used when the learner chose it, or when there is no extension model.
+ * Chosen, the extension is not waited for, so a page without the extension starts at once.
+ */
+export async function loadBackendStatus(
+  win: BackendWindow,
+  savedId: string | null = null,
+  direct: DirectConfig | null = null,
+): Promise<BackendStatus> {
+  const directInfo = directModelInfo(direct);
+  const preferDirect = !!directInfo && isDirectModelId(savedId);
+  const model = await waitForLanguageModel(win, preferDirect ? 0 : 500);
+  const listing = await listAvailableModels(win, preferDirect ? 0 : 800);
+  const models = directInfo ? [...listing.models, directInfo] : listing.models;
   const modelNote = listing.note;
-  const chosen = chooseModel(models, savedId);
+  if (direct && directInfo && (preferDirect || !model)) {
+    return {
+      header: directInfo.name,
+      detail: statusDetail(directInfo, "Ready"),
+      composerEnabled: true,
+      model: createDirectLanguageModel(direct),
+      models,
+      modelNote,
+      chosen: directInfo,
+    };
+  }
+  const chosen = chooseModel(listing.models, savedId);
   if (!model) {
     return { header: MODEL_HEADER, detail: MISSING_MODEL, composerEnabled: false, model: null, models, modelNote, chosen };
   }

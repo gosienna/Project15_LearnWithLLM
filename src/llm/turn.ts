@@ -262,7 +262,7 @@ export class Tutor {
     const alive = () => epoch === this.epoch;
     const model = this.deps.languageModel();
     if (!model) {
-      this.deps.onError("The page cannot see a model. Enable this site in the extension and reload.");
+      this.deps.onError("The page cannot see a model. Add your API key under System, or enable this site in the extension and reload.");
       return;
     }
 
